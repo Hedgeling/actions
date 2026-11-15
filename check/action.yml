@@ -1,0 +1,264 @@
+# v1.3.0 spec 05: the reusable `hedgeling check` Action. A COMPOSITE action
+# (not JavaScript/Docker): it shells out to the published CLI, so there is no
+# bundled dist to keep in sync. Inputs map 1:1 to check flags; the only added
+# behavior is defaulting `base` to the PR base SHA. Permissions needed:
+# `contents: read` — nothing else. Exit codes from the CLI are the contract:
+# 0 pass, 1 check failure (localization regression), 2 configuration error.
+name: 'Hedgeling i18n check'
+description: >-
+  Run `hedgeling check` against a pull request: inline annotations on
+  introduced findings, a localization impact job summary, and a pass/fail
+  status — with zero configuration.
+
+inputs:
+  working-directory:
+    description: Workspace root to check (the directory holding .hedgeling/extract.config.json).
+    required: false
+    default: '.'
+  hedgeling-version:
+    description: >-
+      Override the @hedgeling/i18n version the action runs (any npm package
+      spec: a version, a dist-tag, or a file: path to a local checkout). The
+      default is pinned per action release.
+    required: false
+    default: '1.7.0'
+  npm-token:
+    description: >-
+      Token that lets this action install @hedgeling/i18n — wire from repo
+      secrets (e.g. from `secrets.HEDGELING_TOKEN`). A Hedgeling seat token
+      (`hdg_...`, from the Seats panel in the console) installs the package
+      from Hedgeling's registry; any other value is used as npm auth for the
+      job's default registry. Written as env-indirected auth into a scoped
+      .npmrc in RUNNER_TEMP used only by this action's npx calls — the token
+      value never lands on disk and is never echoed. Leave empty when the job
+      supplies its own .npmrc.
+    required: false
+    default: ''
+  base:
+    description: >-
+      Committish for branch-aware mode (`check --base`). Defaults to the PR
+      base SHA on pull_request events; empty disables baseline mode.
+    required: false
+    default: ''
+  max-untranslated:
+    description: 'Absolute budget: fail when any locale has more than n (or p%) untranslated strings (`--max-untranslated`).'
+    required: false
+    default: ''
+  max-new-untranslated:
+    description: 'Delta budget: fail when a locale grew by more than n untranslated strings since base (`--max-new-untranslated`; needs a base).'
+    required: false
+    default: ''
+  fail-on:
+    description: 'Fail on diagnostics at this severity or worse: required | definite | potential | safe (`--fail-on`).'
+    required: false
+    default: ''
+  require-verified:
+    description: 'Comma-separated locales whose shipping translations must be human-verified (`--require-verified`).'
+    required: false
+    default: ''
+  allow-new:
+    description: Downgrade new strings found by the drift check to warnings (`--allow-new`).
+    required: false
+    default: 'false'
+  schema:
+    description: Verify every committed Hedgeling artifact is readable at this version (`--schema`).
+    required: false
+    default: 'false'
+
+outputs:
+  passed:
+    description: '"true" when every check passed, "false" otherwise.'
+    value: ${{ steps.check.outputs.passed }}
+  report-path:
+    description: Path to the full machine-readable JSON report (the versioned `--json` contract).
+    value: ${{ steps.check.outputs.report-path }}
+  new-strings:
+    description: Number of new strings missing from the committed catalog (the gated drift set).
+    value: ${{ steps.check.outputs.new-strings }}
+  untranslated:
+    description: Total untranslated strings across the checked locales (0 when no bundle is committed).
+    value: ${{ steps.check.outputs.untranslated }}
+  introduced-findings:
+    description: Findings introduced by this change (with a base; without one, the total error count).
+    value: ${{ steps.check.outputs.introduced-findings }}
+
+runs:
+  using: composite
+  steps:
+    - id: node
+      shell: bash
+      run: echo "present=$(command -v node >/dev/null 2>&1 && echo true || echo false)" >> "$GITHUB_OUTPUT"
+
+    - name: Setup Node.js
+      if: steps.node.outputs.present != 'true'
+      uses: actions/setup-node@v7
+      with:
+        node-version: '22'
+
+    # The CLI install is a PRECONDITION, not a check result: resolve/install
+    # the package ONCE up front so a registry failure (a restricted version
+    # without auth, a 404, a network blip) surfaces as a configuration error
+    # (exit 2) — never as a localization regression (exit 1). When npm-token
+    # is set, a scoped userconfig in RUNNER_TEMP carries the auth via npm's
+    # env indirection, so the token value never lands on disk; every npx call
+    # in this action points NPM_CONFIG_USERCONFIG at the same file.
+    - id: cli
+      shell: bash
+      env:
+        HEDGELING_VERSION: ${{ inputs.hedgeling-version }}
+        NPM_TOKEN: ${{ inputs.npm-token }}
+      run: |
+        set -e
+        userconfig=""
+        if [ -n "$NPM_TOKEN" ]; then
+          userconfig="$RUNNER_TEMP/hedgeling-npmrc"
+          # Single quotes on purpose: ${NPM_TOKEN} is npm's own env
+          # indirection, resolved by npm at read time — never by this shell.
+          case "$NPM_TOKEN" in
+            hdg_*)
+              # A seat token: the @hedgeling scope installs from Hedgeling's
+              # registry, and the token is sent nowhere else.
+              printf '@hedgeling:registry=https://platform.thehedgeling.com/registry/\n//platform.thehedgeling.com/registry/:_authToken=${NPM_TOKEN}\n' > "$userconfig"
+              ;;
+            *)
+              registry=$(npm config get registry)
+              registry="${registry%/}"
+              printf '//%s/:_authToken=${NPM_TOKEN}\n' "${registry#*://}" > "$userconfig"
+              ;;
+          esac
+        fi
+        echo "userconfig=$userconfig" >> "$GITHUB_OUTPUT"
+        # file: specs install nothing from a registry — nothing to preflight.
+        case "$HEDGELING_VERSION" in file:*) exit 0 ;; esac
+        if [ -n "$userconfig" ]; then export NPM_CONFIG_USERCONFIG="$userconfig"; fi
+        if ! npx --yes "@hedgeling/i18n@$HEDGELING_VERSION" --help >/dev/null 2>&1; then
+          echo "::error title=hedgeling check::configuration error (exit 2) — could not install @hedgeling/i18n@$HEDGELING_VERSION from the npm registry; this is NOT a localization regression. Set the npm-token input to your Hedgeling seat token (hdg_..., wired from a secret), or supply a job-level .npmrc that can read the package."
+          exit 2
+        fi
+
+    - id: check
+      shell: bash
+      env:
+        HEDGELING_VERSION: ${{ inputs.hedgeling-version }}
+        # Covers pull_request AND pull_request_target; empty on other events.
+        BASE: ${{ inputs.base || github.event.pull_request.base.sha || '' }}
+        WORKING_DIRECTORY: ${{ inputs.working-directory }}
+        MAX_UNTRANSLATED: ${{ inputs.max-untranslated }}
+        MAX_NEW_UNTRANSLATED: ${{ inputs.max-new-untranslated }}
+        FAIL_ON: ${{ inputs.fail-on }}
+        REQUIRE_VERIFIED: ${{ inputs.require-verified }}
+        ALLOW_NEW: ${{ inputs.allow-new }}
+        SCHEMA: ${{ inputs.schema }}
+        NPM_TOKEN: ${{ inputs.npm-token }}
+        HEDGELING_NPMRC: ${{ steps.cli.outputs.userconfig }}
+      run: |
+        # npm auth from the preflight (step `cli`), when configured.
+        if [ -n "$HEDGELING_NPMRC" ]; then export NPM_CONFIG_USERCONFIG="$HEDGELING_NPMRC"; fi
+        report="$RUNNER_TEMP/hedgeling-check.json"
+        summary="$RUNNER_TEMP/hedgeling-check-summary.md"
+        # Never inherit files from a previous invocation in the same job.
+        rm -f "$report" "$summary"
+        # Run from the checkout root and pass the project dir as the
+        # POSITIONAL arg: `check` prefixes annotation file paths with
+        # relative(cwd, projectDir), so a monorepo subfolder's findings
+        # attach to the diff by checkout-root paths. Running inside the
+        # subfolder instead would compute an empty prefix and the
+        # annotations would never land.
+        args=(check "$WORKING_DIRECTORY" --github --json --summary "$summary")
+        if [ ! -d "$WORKING_DIRECTORY" ]; then
+          echo "::error title=hedgeling check::configuration error — working-directory \"$WORKING_DIRECTORY\" does not exist in the checkout."
+          exit 2
+        fi
+        # file: specs make npm SYMLINK the directory instead of packing it,
+        # and npm never chmods the bin targets of linked packages — if the
+        # build emitted dist/cli/index.js as 0644 (tsc default), `npx
+        # hedgeling` dies with "Permission denied". Fix the bit up front.
+        if [[ "$HEDGELING_VERSION" == file:* ]]; then
+          cli_bin="${HEDGELING_VERSION#file:}/dist/cli/index.js"
+          if [ ! -f "$cli_bin" ]; then
+            echo "::error title=hedgeling check::configuration error — hedgeling-version points at \"$HEDGELING_VERSION\" but $cli_bin does not exist (build the package first)."
+            exit 2
+          fi
+          chmod +x "$cli_bin"
+        fi
+        base_fetch_failed=false
+        if [ -n "$BASE" ]; then
+          # actions/checkout defaults to a shallow clone of the merge commit;
+          # best-effort fetch so the base SHA resolves without extra setup.
+          # GitHub's git endpoint fails transiently now and then (observed:
+          # "RPC failed; HTTP 404 ... expected packfile"), so the fetch gets a
+          # bounded retry: 3 attempts, backing off 2s then 5s. The delays are
+          # overridable (HEDGELING_BASE_FETCH_DELAYS) only so tests never sleep.
+          if ! git rev-parse -q --verify "$BASE^{commit}" >/dev/null 2>&1; then
+            read -ra fetch_delays <<< "${HEDGELING_BASE_FETCH_DELAYS:-2 5}"
+            fetch_attempts=$(( ${#fetch_delays[@]} + 1 ))
+            fetch_attempt=1
+            while :; do
+              if git fetch --no-tags --depth=1 origin "$BASE" >/dev/null 2>&1; then
+                break
+              fi
+              if [ "$fetch_attempt" -ge "$fetch_attempts" ]; then
+                base_fetch_failed=true
+                echo "::warning title=hedgeling check::could not fetch base $BASE after $fetch_attempts attempts — this is most likely a transient failure on GitHub's side (git fetch errors such as HTTP 404 / expected packfile); re-run the job. Baseline mode needs the base commit."
+                break
+              fi
+              delay="${fetch_delays[$(( fetch_attempt - 1 ))]}"
+              echo "::warning title=hedgeling check::fetching base $BASE failed (attempt $fetch_attempt/$fetch_attempts) — retrying in ${delay}s."
+              sleep "$delay"
+              fetch_attempt=$(( fetch_attempt + 1 ))
+            done
+          fi
+          args+=(--base "$BASE")
+        fi
+        [ -n "$MAX_UNTRANSLATED" ] && args+=(--max-untranslated "$MAX_UNTRANSLATED")
+        [ -n "$MAX_NEW_UNTRANSLATED" ] && args+=(--max-new-untranslated "$MAX_NEW_UNTRANSLATED")
+        [ -n "$FAIL_ON" ] && args+=(--fail-on "$FAIL_ON")
+        [ -n "$REQUIRE_VERIFIED" ] && args+=(--require-verified "$REQUIRE_VERIFIED")
+        [ "$ALLOW_NEW" = "true" ] && args+=(--allow-new)
+        [ "$SCHEMA" = "true" ] && args+=(--schema)
+
+        # Annotations go to stderr (--github + --json) and the runner scans
+        # both streams; stdout is the one parseable JSON document.
+        set +e
+        npx --yes "@hedgeling/i18n@$HEDGELING_VERSION" "${args[@]}" > "$report"
+        code=$?
+        set -e
+
+        echo "report-path=$report" >> "$GITHUB_OUTPUT"
+        if [ -f "$summary" ]; then
+          cat "$summary" >> "$GITHUB_STEP_SUMMARY"
+        fi
+        # Parse step outputs from the report. Tolerate a missing/corrupt
+        # report (e.g. a configuration error aborted before the JSON was
+        # printed) — the exit-code mapping below must still run.
+        if ! node -e '
+            const fs = require("node:fs");
+            const report = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+            const checks = report.checks ?? [];
+            const drift = checks.find((c) => c.name === "drift") ?? { items: [] };
+            const newStrings = drift.items.filter((i) => i.message.startsWith("new string not in the committed catalog")).length;
+            const untranslated = (report.untranslatedByLocale ?? []).reduce((n, l) => n + l.untranslated, 0);
+            const introduced = checks.some((c) => c.introduced)
+              ? checks.reduce((n, c) => n + (c.introduced?.length ?? 0), 0)
+              : checks.reduce((n, c) => n + c.items.filter((i) => i.level === "error").length, 0);
+            fs.appendFileSync(
+              process.env.GITHUB_OUTPUT,
+              `passed=${report.passed}\nnew-strings=${newStrings}\nuntranslated=${untranslated}\nintroduced-findings=${introduced}\n`,
+            );
+          ' "$report" 2>/dev/null; then
+          printf 'passed=false\nnew-strings=0\nuntranslated=0\nintroduced-findings=0\n' >> "$GITHUB_OUTPUT"
+        fi
+
+        # Failure discipline: exit 2 is a setup problem, never a localization
+        # regression — prefix it so users cannot misread one as the other.
+        if [ "$code" -eq 2 ]; then
+          if [ "$base_fetch_failed" = "true" ]; then
+            echo "::error title=hedgeling check::configuration error (exit 2) — the base commit $BASE could not be fetched, so the CLI could not run baseline mode (--base). This is NOT a localization regression and is most likely a transient failure on GitHub's side: re-run the job."
+            exit 2
+          fi
+          echo "::error title=hedgeling check::configuration error (exit 2) — an input or committed artifact is invalid; this is NOT a localization regression. See the step log."
+          exit 2
+        elif [ "$code" -ne 0 ]; then
+          echo "::error title=hedgeling check::localization check failed — see the inline annotations and the job summary."
+          exit "$code"
+        fi

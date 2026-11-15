@@ -1,0 +1,13 @@
+Copyright (c) 2026 Hedgeling LLC. All rights reserved.
+
+The files in this repository are GitHub Actions workflow definitions and
+their documentation. Hedgeling LLC permits you to use them, unmodified, in
+your own GitHub workflows for the purpose of running Hedgeling under an
+active Hedgeling account.
+
+The `@hedgeling/i18n` package that these actions install is not part of this
+repository. It is licensed under its own End User License Agreement, and your
+use of the Hedgeling service is governed by the Hedgeling Terms of Service at
+https://thehedgeling.com/terms.
+
+These files are provided "as is", without warranty of any kind.

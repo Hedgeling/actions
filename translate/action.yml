@@ -1,0 +1,528 @@
+# v1.3.0 spec 06: the automated localization-PR Action. A COMPOSITE action
+# (like actions/check): it runs the SAME CLI pipeline a developer runs —
+# `hedgeling translate` (extract → translate, all writes through writeState /
+# compile, nothing bespoke) — then turns the resulting diff into ONE standing
+# PR on the fixed branch `hedgeling/localize`. A new run force-pushes a
+# regenerated branch and edits the existing PR: serial, idempotent, no PR
+# pile-up. The decision (diff present? unrelated dirty path? PR open?) is the
+# CLI's `localize-plan` — this file only carries git/gh execution.
+#
+# Permissions — honest about writing (the check action stays read-only):
+#   contents: write        push the regenerated hedgeling/localize branch
+#   pull-requests: write   create/edit the localization PR
+# Checks on the bot PR: events caused by the default GITHUB_TOKEN do NOT
+# trigger new workflow runs (GitHub anti-recursion). Wire a PAT or GitHub
+# App token via the `token` input if the localization PR must run the
+# `hedgeling check` gate like a human PR. The token then authenticates BOTH
+# the `gh` calls and the branch push — actions/checkout persists GITHUB_TOKEN
+# for git, and a branch pushed with GITHUB_TOKEN would keep suppressing the
+# PR's checks on every update even though the PR itself was bot-authored.
+# Secrets: the provider key arrives as the `api-key` input wired from repo
+# secrets and reaches the CLI exclusively via HEDGELING_TRANSLATE_API_KEY —
+# never echoed, never written to the run report.
+name: 'Hedgeling translate'
+description: >-
+  Run `hedgeling translate` and deliver the localization work as a single,
+  idempotent PR on `hedgeling/localize`: catalog/state/bundle diffs a human
+  can approve, gated by `hedgeling check` like any other change.
+
+inputs:
+  working-directory:
+    description: Workspace root holding .hedgeling/extract.config.json.
+    required: false
+    default: '.'
+  hedgeling-version:
+    description: >-
+      Override the @hedgeling/i18n version the action runs (any npm package
+      spec: a version, a dist-tag, or a file: path to a local checkout). The
+      default is pinned per action release.
+    required: false
+    default: '1.7.0'
+  npm-token:
+    description: >-
+      Token that lets this action install @hedgeling/i18n — wire from repo
+      secrets (e.g. from `secrets.HEDGELING_TOKEN`). A Hedgeling seat token
+      (`hdg_...`, from the Seats panel in the console) installs the package
+      from Hedgeling's registry; any other value is used as npm auth for the
+      job's default registry. Written as env-indirected auth into a scoped
+      .npmrc in RUNNER_TEMP used only by this action's npx calls — the token
+      value never lands on disk and is never echoed. Leave empty when the job
+      supplies its own .npmrc.
+    required: false
+    default: ''
+  api-key:
+    # NOTE (all description strings): the runner template-evaluates input
+    # descriptions at action-load time, where the `secrets` context does not
+    # exist — a literal `${{ secrets.X }}` example here makes the whole action
+    # unloadable ("Unrecognized named-value: 'secrets'"). Keep examples plain.
+    description: >-
+      Machine-translation API key — wire from repo secrets (e.g. from
+      `secrets.HEDGELING_TRANSLATE_API_KEY`). Passed to the
+      CLI as HEDGELING_TRANSLATE_API_KEY, the generic env every provider
+      honors; provider-specific envs set at job level also work.
+    required: false
+    default: ''
+  locales:
+    description: 'Comma-separated target locales (`--locales`); defaults to the config locales.'
+    required: false
+    default: ''
+  force-locales:
+    description: 'Comma-separated locales to re-translate even if already translated (`--force-locales`).'
+    required: false
+    default: ''
+  glossary:
+    description: 'Path to a glossary JSON file overriding .hedgeling/glossary.json (`--glossary`).'
+    required: false
+    default: ''
+  base-branch:
+    description: 'Base branch for the localization PR; defaults to the branch that triggered the workflow.'
+    required: false
+    default: ''
+  job:
+    description: >-
+      Set to 'true' to bind the run to a repo-native translation job (spec
+      07): the run creates a `.hedgeling/jobs/<id>.json` artifact scoped to
+      the currently untranslated work, translates through `--job <id>`, and
+      the artifact rides the same localization PR. The standing branch is
+      regenerated every run, so only the newest job artifact rides an
+      unmerged PR. Off by default.
+    required: false
+    default: 'false'
+  sync:
+    description: >-
+      Set to 'true' to run `hedgeling sync pull` before translating (spec 10):
+      console review verdicts and human edits land in repo state through the
+      normal compile path and ride this localization PR — the sanctioned way
+      review truth returns to the repo. Conflicts never fail the run: the CLI
+      marks them needs-review (repo text kept) and they arrive in the PR for
+      a human. Transport failures (exit 2) retry 3× with backoff, then fail.
+      Requires `console-token` (or job-level HEDGELING_CONSOLE_* env). Off by
+      default.
+    required: false
+    default: 'false'
+  console-token:
+    description: >-
+      Console service-account credential (hdlg_sa_…) for `sync pull` — wire
+      from repo secrets (e.g. from `secrets.HEDGELING_CONSOLE_TOKEN`).
+      Passed to the CLI as HEDGELING_CONSOLE_TOKEN, never echoed. Pull needs
+      only the strings.view permission — scope the account accordingly.
+    required: false
+    default: ''
+  console-url:
+    description: >-
+      Console origin for `sync pull`, passed as `--origin` (highest
+      precedence). When empty the CLI resolves the committed cursor
+      artifact's consoleOrigin, then HEDGELING_CONSOLE_URL.
+    required: false
+    default: ''
+  project:
+    description: >-
+      Console project slug for `sync pull` (`--project`). When empty the CLI
+      resolves projectSlug from .hedgeling/extract.config.json.
+    required: false
+    default: ''
+  token:
+    description: >-
+      Token used for `gh` calls (pr list/create/edit/reopen) AND for pushing
+      the localization branch. Defaults to the job's GITHUB_TOKEN. Events
+      caused by GITHUB_TOKEN do NOT trigger workflow runs — wire a PAT or
+      GitHub App token (e.g. from `secrets.HEDGELING_BOT_TOKEN`)
+      when the localization PR must run `hedgeling check` or other
+      PR-triggered gates automatically. When set, the push authenticates with
+      this token for that one command (checkout's persisted GITHUB_TOKEN
+      credentials are overridden, never rewritten); over a non-HTTP remote
+      (e.g. an SSH deploy key) the push keeps the remote's own auth and the
+      token drives `gh` only. Required permissions: Contents: Read and write
+      AND Pull requests: Read and write (for GITHUB_TOKEN: `contents: write`
+      and `pull-requests: write` in the workflow's permissions block). A
+      token missing the PR permission fails the run before pushing, naming it.
+    required: false
+    default: ''
+
+outputs:
+  changed:
+    description: '"true" when the run produced a localization diff (a branch was pushed); "false" on nothing-to-localize.'
+    value: ${{ steps.decide.outputs.changed }}
+  pr-url:
+    description: URL of the created or updated localization PR (empty on nothing-to-localize).
+    value: ${{ steps.pr.outputs.pr-url || steps.decide.outputs.pr-url }}
+  report-path:
+    description: Path to the versioned JSON run report (`--report` contract).
+    value: ${{ steps.translate.outputs.report-path }}
+  translated:
+    description: Provider-accepted translations this run.
+    value: ${{ steps.translate.outputs.translated }}
+  failed:
+    description: Translation attempts the accept loop rejected this run.
+    value: ${{ steps.translate.outputs.failed }}
+  needs-review:
+    description: Records shipped as needs-review (fuzzy carry-over rungs 2–3) — the human queue this PR feeds.
+    value: ${{ steps.translate.outputs.needs-review }}
+  job-id:
+    description: >-
+      Id of the translation job bound to this run (empty unless the `job`
+      input is 'true' and work was in scope).
+    value: ${{ steps.translate.outputs.job-id }}
+  sync-conflicts:
+    description: >-
+      Conflicts the pre-translate `sync pull` classified (empty unless the
+      `sync` input is 'true'). They never fail the run — the entries are
+      marked needs-review and ride this PR.
+    value: ${{ steps.sync-pull.outputs.conflicts }}
+
+runs:
+  using: composite
+  steps:
+    - id: node
+      shell: bash
+      run: echo "present=$(command -v node >/dev/null 2>&1 && echo true || echo false)" >> "$GITHUB_OUTPUT"
+
+    - name: Setup Node.js
+      if: steps.node.outputs.present != 'true'
+      uses: actions/setup-node@v7
+      with:
+        node-version: '22'
+
+    # The CLI install is a PRECONDITION, not a result: resolve/install the
+    # package ONCE up front so a registry failure (a restricted version
+    # without auth, a 404, a network blip) surfaces as a configuration error
+    # (exit 2) — never as a translation failure. When npm-token is set, a
+    # scoped userconfig in RUNNER_TEMP carries the auth via npm's env
+    # indirection, so the token value never lands on disk; every npx call in
+    # this action points NPM_CONFIG_USERCONFIG at the same file.
+    - id: cli
+      shell: bash
+      env:
+        HEDGELING_VERSION: ${{ inputs.hedgeling-version }}
+        NPM_TOKEN: ${{ inputs.npm-token }}
+        # A seat token also tells the CLI which plan's limits apply.
+        HEDGELING_TOKEN: ${{ startsWith(inputs.npm-token, 'hdg_') && inputs.npm-token || env.HEDGELING_TOKEN }}
+      run: |
+        set -e
+        userconfig=""
+        if [ -n "$NPM_TOKEN" ]; then
+          userconfig="$RUNNER_TEMP/hedgeling-npmrc"
+          # Single quotes on purpose: ${NPM_TOKEN} is npm's own env
+          # indirection, resolved by npm at read time — never by this shell.
+          case "$NPM_TOKEN" in
+            hdg_*)
+              # A seat token: the @hedgeling scope installs from Hedgeling's
+              # registry, and the token is sent nowhere else.
+              printf '@hedgeling:registry=https://platform.thehedgeling.com/registry/\n//platform.thehedgeling.com/registry/:_authToken=${NPM_TOKEN}\n' > "$userconfig"
+              ;;
+            *)
+              registry=$(npm config get registry)
+              registry="${registry%/}"
+              printf '//%s/:_authToken=${NPM_TOKEN}\n' "${registry#*://}" > "$userconfig"
+              ;;
+          esac
+        fi
+        echo "userconfig=$userconfig" >> "$GITHUB_OUTPUT"
+        # file: specs install nothing from a registry — nothing to preflight.
+        case "$HEDGELING_VERSION" in file:*) exit 0 ;; esac
+        if [ -n "$userconfig" ]; then export NPM_CONFIG_USERCONFIG="$userconfig"; fi
+        if ! npx --yes "@hedgeling/i18n@$HEDGELING_VERSION" --help >/dev/null 2>&1; then
+          echo "::error title=hedgeling translate::configuration error (exit 2) — could not install @hedgeling/i18n@$HEDGELING_VERSION from the npm registry; this is NOT a translation failure. Set the npm-token input to your Hedgeling seat token (hdg_..., wired from a secret), or supply a job-level .npmrc that can read the package."
+          exit 2
+        fi
+
+    # Spec 10: the localization PR is where console review truth re-enters the
+    # repo — pull BEFORE translating so verdicts/edits inform carry-over and
+    # ride the same PR. Everything a pull writes (state, bundles,
+    # .hedgeling/sync.json, .hedgeling/sync-revisions.jsonl) is inside the
+    # committable artifact set localize-plan allows.
+    - id: sync-pull
+      if: inputs.sync == 'true'
+      shell: bash
+      env:
+        HEDGELING_VERSION: ${{ inputs.hedgeling-version }}
+        WORKING_DIRECTORY: ${{ inputs.working-directory }}
+        HEDGELING_CONSOLE_TOKEN: ${{ inputs.console-token }}
+        CONSOLE_URL: ${{ inputs.console-url }}
+        PROJECT: ${{ inputs.project }}
+        GLOSSARY: ${{ inputs.glossary }}
+        NPM_TOKEN: ${{ inputs.npm-token }}
+        # A seat token also tells the CLI which plan's limits apply.
+        HEDGELING_TOKEN: ${{ startsWith(inputs.npm-token, 'hdg_') && inputs.npm-token || env.HEDGELING_TOKEN }}
+        HEDGELING_NPMRC: ${{ steps.cli.outputs.userconfig }}
+      run: |
+        set -e
+        # npm auth from the preflight (step `cli`), when configured.
+        if [ -n "$HEDGELING_NPMRC" ]; then export NPM_CONFIG_USERCONFIG="$HEDGELING_NPMRC"; fi
+        json="$RUNNER_TEMP/hedgeling-sync-pull.json"
+        rm -f "$json"
+        args=(sync pull "$WORKING_DIRECTORY" --json)
+        [ -n "$CONSOLE_URL" ] && args+=(--origin "$CONSOLE_URL")
+        [ -n "$PROJECT" ] && args+=(--project "$PROJECT")
+        # The same glossary as the translate run: pull-side validation must
+        # agree with the pipeline's effective terminology.
+        [ -n "$GLOSSARY" ] && args+=(--glossary "$GLOSSARY")
+        # Retry ONLY exit 2 (configuration/transport) with linear backoff — a
+        # flaky 502 must not fail the localization run. Exit 1 (conflicts)
+        # means the pull COMPLETED: the entries are needs-review in state and
+        # ride this PR, so it is a warning here, never a failure.
+        attempt=1
+        code=0
+        while :; do
+          code=0
+          npx --yes "@hedgeling/i18n@$HEDGELING_VERSION" "${args[@]}" > "$json" || code=$?
+          [ "$code" -ne 2 ] && break
+          [ "$attempt" -ge 3 ] && break
+          delay=$(( 10 * attempt ))
+          echo "::warning title=hedgeling sync pull::attempt $attempt/3 failed (exit 2, configuration/transport) — retrying in ${delay}s."
+          sleep "$delay"
+          attempt=$(( attempt + 1 ))
+        done
+        if [ "$code" -eq 2 ]; then
+          echo "::error title=hedgeling sync pull::configuration/transport failure (exit 2) after $attempt attempt(s) — check the console origin, the console-token secret, and the project slug."
+          exit 2
+        fi
+        node -e '
+          const fs = require("node:fs");
+          const body = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+          const conflicts = Array.isArray(body.conflicts) ? body.conflicts.length : 0;
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, `conflicts=${conflicts}\napplied=${body.applied ?? 0}\n`);
+        ' "$json"
+        if [ "$code" -eq 1 ]; then
+          echo "::warning title=hedgeling sync pull::pull completed with conflicts — repo text kept, entries marked needs-review; they ride this localization PR."
+        fi
+
+    - id: translate
+      shell: bash
+      env:
+        HEDGELING_VERSION: ${{ inputs.hedgeling-version }}
+        WORKING_DIRECTORY: ${{ inputs.working-directory }}
+        # The key reaches the CLI only through env; when the input is empty
+        # the variable stays empty and the provider's own key check reports.
+        HEDGELING_TRANSLATE_API_KEY: ${{ inputs.api-key }}
+        LOCALES: ${{ inputs.locales }}
+        FORCE_LOCALES: ${{ inputs.force-locales }}
+        GLOSSARY: ${{ inputs.glossary }}
+        JOB: ${{ inputs.job }}
+        NPM_TOKEN: ${{ inputs.npm-token }}
+        # A seat token also tells the CLI which plan's limits apply.
+        HEDGELING_TOKEN: ${{ startsWith(inputs.npm-token, 'hdg_') && inputs.npm-token || env.HEDGELING_TOKEN }}
+        HEDGELING_NPMRC: ${{ steps.cli.outputs.userconfig }}
+        SYNC_CONFLICTS: ${{ steps.sync-pull.outputs.conflicts }}
+      run: |
+        set -e
+        # npm auth from the preflight (step `cli`), when configured.
+        if [ -n "$HEDGELING_NPMRC" ]; then export NPM_CONFIG_USERCONFIG="$HEDGELING_NPMRC"; fi
+        report="$RUNNER_TEMP/hedgeling-translate-report.json"
+        markdown="$RUNNER_TEMP/hedgeling-translate.md"
+        # Never inherit files from a previous invocation in the same job.
+        rm -f "$report" "$markdown"
+        if [ ! -d "$WORKING_DIRECTORY" ]; then
+          echo "::error title=hedgeling translate::configuration error — working-directory \"$WORKING_DIRECTORY\" does not exist in the checkout."
+          exit 2
+        fi
+        # Spec 07: `job: true` binds the run to a committed job artifact. The
+        # CLI prints the new id as the only stdout line; an empty scope
+        # (nothing untranslated) exits non-zero and the run simply proceeds
+        # unbound — a PR must never exist just to carry an empty job file.
+        job_id=""
+        if [ "$JOB" = "true" ]; then
+          job_args=(job create "$WORKING_DIRECTORY" --created-by action --filter untranslated)
+          [ -n "$LOCALES" ] && job_args+=(--locales "$LOCALES")
+          # The same glossary as the translate run: DNT filtering shapes the
+          # extracted key set, so scope resolution must agree with the run.
+          [ -n "$GLOSSARY" ] && job_args+=(--glossary "$GLOSSARY")
+          job_id=$(npx --yes "@hedgeling/i18n@$HEDGELING_VERSION" "${job_args[@]}") || job_id=""
+        fi
+        # The SAME entrypoint a developer runs — `translate` extracts and
+        # writes the catalog itself, then batches locales through the
+        # configured provider. All artifact writes go through writeState /
+        # compile; the reports land in $RUNNER_TEMP, outside the checkout,
+        # so they can never pollute the diff the next step measures.
+        args=(translate "$WORKING_DIRECTORY" --report "$report" --report-markdown "$markdown")
+        [ -n "$LOCALES" ] && args+=(--locales "$LOCALES")
+        [ -n "$FORCE_LOCALES" ] && args+=(--force-locales "$FORCE_LOCALES")
+        [ -n "$GLOSSARY" ] && args+=(--glossary "$GLOSSARY")
+        [ -n "$job_id" ] && args+=(--job "$job_id")
+        # The sync-pull step's conflicts ride the PR body (key, locale, both
+        # texts) — not only its step log.
+        sync_json="$RUNNER_TEMP/hedgeling-sync-pull.json"
+        if [ "${SYNC_CONFLICTS:-0}" -gt 0 ] && [ -f "$sync_json" ]; then
+          args+=(--sync-conflicts "$sync_json")
+        fi
+        npx --yes "@hedgeling/i18n@$HEDGELING_VERSION" "${args[@]}"
+
+        {
+          echo "report-path=$report"
+          echo "markdown-path=$markdown"
+          echo "job-id=$job_id"
+        } >> "$GITHUB_OUTPUT"
+        # Step outputs ride the versioned report contract — never log parsing.
+        node -e '
+          const fs = require("node:fs");
+          const report = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+          fs.appendFileSync(
+            process.env.GITHUB_OUTPUT,
+            `translated=${report.counts.translated}\nfailed=${report.counts.failed}\nneeds-review=${report.counts.needsReview}\n`,
+          );
+        ' "$report"
+
+    - id: decide
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token || github.token }}
+        HEDGELING_VERSION: ${{ inputs.hedgeling-version }}
+        WORKING_DIRECTORY: ${{ inputs.working-directory }}
+        BRANCH: hedgeling/localize
+        NPM_TOKEN: ${{ inputs.npm-token }}
+        # A seat token also tells the CLI which plan's limits apply.
+        HEDGELING_TOKEN: ${{ startsWith(inputs.npm-token, 'hdg_') && inputs.npm-token || env.HEDGELING_TOKEN }}
+        HEDGELING_NPMRC: ${{ steps.cli.outputs.userconfig }}
+      run: |
+        set -e
+        # npm auth from the preflight (step `cli`), when configured.
+        if [ -n "$HEDGELING_NPMRC" ]; then export NPM_CONFIG_USERCONFIG="$HEDGELING_NPMRC"; fi
+        # Repo state the pure decision needs: an open PR on the fixed branch
+        # (update vs create) and whether the branch exists (log line only —
+        # the branch is always regenerated from HEAD and force-pushed).
+        # A FAILED probe is not "no open PR": swallowing it (soak #17) let a
+        # token that can push but not manage PRs push the branch, then fail
+        # `gh pr create` silently. Keep the error; it is fatal below only
+        # when this run would actually open or update a PR.
+        probe_err="$RUNNER_TEMP/hedgeling-pr-probe.err"
+        probe_ok=true
+        pr_url=$(gh pr list --head "$BRANCH" --state open --json url --jq '.[0].url // empty' 2>"$probe_err") || probe_ok=false
+        [ "$probe_ok" = true ] || pr_url=""
+        plan_args=(localize-plan "$WORKING_DIRECTORY")
+        [ -n "$pr_url" ] && plan_args+=(--pr-open)
+        if git ls-remote --exit-code --heads origin "refs/heads/$BRANCH" >/dev/null 2>&1; then
+          plan_args+=(--branch-exists)
+        fi
+        plan_file="$RUNNER_TEMP/hedgeling-localize-plan.json"
+        npx --yes "@hedgeling/i18n@$HEDGELING_VERSION" "${plan_args[@]}" > "$plan_file"
+
+        action=$(node -e 'process.stdout.write(JSON.parse(require("node:fs").readFileSync(process.argv[1],"utf8")).action)' "$plan_file")
+        echo "action=$action" >> "$GITHUB_OUTPUT"
+        echo "pr-url=$pr_url" >> "$GITHUB_OUTPUT"
+        echo "commit-paths=$RUNNER_TEMP/hedgeling-commit-paths.txt" >> "$GITHUB_OUTPUT"
+
+        if [ "$action" = "error" ]; then
+          node -e '
+            const plan = JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8"));
+            console.log(`::error title=hedgeling translate::${plan.reason}: ${plan.offendingPaths.join(", ")}`);
+          ' "$plan_file"
+          exit 1
+        fi
+        if [ "$probe_ok" != true ]; then
+          probe_msg=$(tr '\n' ' ' < "$probe_err")
+          if [ "$action" = "create" ] || [ "$action" = "update" ]; then
+            echo "::error title=hedgeling translate::cannot list pull requests with the configured token ($probe_msg) — the token input (or GITHUB_TOKEN) needs Pull requests: Read and write — a fine-grained PAT or GitHub App with that permission, or pull-requests: write in the workflow permissions block when using GITHUB_TOKEN. Nothing was pushed."
+            exit 1
+          fi
+          echo "::warning title=hedgeling translate::cannot list pull requests with the configured token ($probe_msg) — the token input (or GITHUB_TOKEN) needs Pull requests: Read and write — a fine-grained PAT or GitHub App with that permission, or pull-requests: write in the workflow permissions block when using GITHUB_TOKEN. Harmless for this no-op run; a run with changes would fail."
+        fi
+        if [ "$action" = "noop" ]; then
+          echo "changed=false" >> "$GITHUB_OUTPUT"
+          {
+            echo "## Hedgeling localization"
+            echo ""
+            echo "Nothing to localize — the run produced no catalog/state/bundle diff."
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit 0
+        fi
+        echo "changed=true" >> "$GITHUB_OUTPUT"
+        node -e '
+          const fs = require("node:fs");
+          const plan = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+          fs.writeFileSync(process.argv[2], `${plan.commitPaths.join("\n")}\n`);
+        ' "$plan_file" "$RUNNER_TEMP/hedgeling-commit-paths.txt"
+
+    - id: pr
+      if: steps.decide.outputs.action == 'create' || steps.decide.outputs.action == 'update'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token || github.token }}
+        BOT_TOKEN: ${{ inputs.token }}
+        ACTION: ${{ steps.decide.outputs.action }}
+        EXISTING_PR_URL: ${{ steps.decide.outputs.pr-url }}
+        COMMIT_PATHS: ${{ steps.decide.outputs.commit-paths }}
+        BASE_BRANCH: ${{ inputs.base-branch || github.ref_name }}
+        BRANCH: hedgeling/localize
+        MARKDOWN_PATH: ${{ steps.translate.outputs.markdown-path }}
+      run: |
+        set -e
+        git config user.name "github-actions[bot]"
+        git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+        # The branch is regenerated from the current head (the commit that
+        # triggered this run) — the dirty tree is all Hedgeling artifacts at
+        # this point, and they ride the checkout into the new branch. The
+        # trap restores the original checkout afterwards: the action must not
+        # leave later steps in the job sitting on the localization branch
+        # (fires on failure paths too — that's why it's a trap, not a step).
+        trap 'git checkout - >/dev/null 2>&1 || git checkout --detach HEAD >/dev/null 2>&1 || true' EXIT
+        git checkout -B "$BRANCH"
+        git add --pathspec-from-file="$COMMIT_PATHS"
+        # --no-verify: machine-generated bytes must land verbatim — a hook
+        # that reformats the bundle (prettier etc.) would break the "same
+        # input ⇒ same bytes" determinism and make every run look dirty.
+        git commit --no-verify -m "chore(i18n): hedgeling localization update"
+        # Track the remote branch (when it exists) so --force-with-lease can
+        # refuse a lost race instead of clobbering a concurrent run's push.
+        git fetch --no-tags --depth=1 origin "+refs/heads/$BRANCH:refs/remotes/origin/$BRANCH" >/dev/null 2>&1 || true
+        # Push with the SAME identity gh uses. actions/checkout persists the
+        # job's GITHUB_TOKEN as an http.extraheader for git, so a custom
+        # `token` used to author the PR while GITHUB_TOKEN pushed the branch
+        # — and events caused by GITHUB_TOKEN never trigger workflow runs
+        # (GitHub anti-recursion), so the promised PR checks never fired on
+        # branch updates. When a token is supplied and origin is HTTP(S),
+        # reset checkout's extraheader and substitute the bot token's basic
+        # auth for THIS push only: nothing persisted, nothing in a URL,
+        # nothing echoed. Non-HTTP remotes (SSH deploy keys) keep their own
+        # auth — there the token drives gh only.
+        push_auth=()
+        if [ -n "$BOT_TOKEN" ]; then
+          origin_url=$(git remote get-url origin)
+          case "$origin_url" in
+            http://*|https://*)
+              proto="${origin_url%%://*}"
+              host="${origin_url#*://}"; host="${host%%/*}"
+              auth_b64=$(printf '%s' "x-access-token:${BOT_TOKEN}" | base64 | tr -d '\n')
+              push_auth=(-c "http.${proto}://${host}/.extraheader=" -c "http.${proto}://${host}/.extraheader=AUTHORIZATION: basic ${auth_b64}")
+              ;;
+          esac
+        fi
+        git "${push_auth[@]}" push --force-with-lease="refs/heads/$BRANCH" origin "HEAD:refs/heads/$BRANCH"
+        if [ "$ACTION" = "create" ]; then
+          # A CLOSED localization PR is invisible to the open-PR probe: reopen
+          # it rather than failing `gh pr create` — the regenerated branch
+          # already force-pushed, so the standing PR carries current work.
+          # Keep gh's own error (soak #17): when there is no closed PR to
+          # reopen either, the reason — usually the token's PR permission —
+          # must reach the log, not /dev/null.
+          create_err=$(mktemp)
+          if ! pr_url=$(gh pr create --title "chore(i18n): Hedgeling localization update" --body-file "$MARKDOWN_PATH" --base "$BASE_BRANCH" --head "$BRANCH" 2>"$create_err"); then
+            gh pr reopen "$BRANCH" >/dev/null 2>&1 || true
+            gh pr edit "$BRANCH" --body-file "$MARKDOWN_PATH" >/dev/null 2>&1 || true
+            if ! pr_url=$(gh pr view "$BRANCH" --json url --jq '.url' 2>>"$create_err"); then
+              create_msg=$(tr '\n' ' ' < "$create_err")
+              echo "::error title=hedgeling translate::the branch $BRANCH was pushed, but the pull request could not be opened ($create_msg) — the token input (or GITHUB_TOKEN) needs Pull requests: Read and write — a fine-grained PAT or GitHub App with that permission, or pull-requests: write in the workflow permissions block when using GITHUB_TOKEN. The next run force-pushes the branch again and retries."
+              exit 1
+            fi
+          fi
+        else
+          if ! edit_out=$(gh pr edit "$BRANCH" --body-file "$MARKDOWN_PATH" 2>&1 >/dev/null); then
+            echo "::error title=hedgeling translate::the branch $BRANCH was pushed, but the pull request body could not be updated ($(printf '%s' "$edit_out" | tr '\n' ' ')) — the token input (or GITHUB_TOKEN) needs Pull requests: Read and write — a fine-grained PAT or GitHub App with that permission, or pull-requests: write in the workflow permissions block when using GITHUB_TOKEN."
+            exit 1
+          fi
+          pr_url="$EXISTING_PR_URL"
+        fi
+        echo "pr-url=$pr_url" >> "$GITHUB_OUTPUT"
+
+    - name: Job summary
+      if: always()
+      shell: bash
+      env:
+        MARKDOWN_PATH: ${{ steps.translate.outputs.markdown-path }}
+        PR_URL: ${{ steps.pr.outputs.pr-url }}
+      run: |
+        # `if` guards, not bare `[ ... ] && ...`: with GitHub's bash defaults
+        # (-e, and a false test as the step's last command) a missing markdown
+        # file or an empty PR_URL — the NORMAL nothing-to-localize outcome —
+        # would fail an otherwise successful run with exit code 1.
+        if [ -f "$MARKDOWN_PATH" ]; then cat "$MARKDOWN_PATH" >> "$GITHUB_STEP_SUMMARY"; fi
+        if [ -n "$PR_URL" ]; then printf '\n**Localization PR:** %s\n' "$PR_URL" >> "$GITHUB_STEP_SUMMARY"; fi

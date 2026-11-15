@@ -1,0 +1,384 @@
+# v1.3.0 spec 10 adoption surface: the console ↔ repo sync Action. A COMPOSITE
+# action (like actions/check and actions/translate): it runs the SAME CLI
+# command a developer runs — `hedgeling sync push|pull` — so the merge law,
+# validation, idempotency pins, and exit-code contract all live in the CLI;
+# this file only carries CI ergonomics:
+#
+#   - retry/backoff on exit 2 (configuration/transport): a flaky 502 must not
+#     fail a merge-to-main workflow. Exit 1 (conflicts) is NEVER retried —
+#     the sync COMPLETED and needs human attention, a retry cannot help.
+#   - push mode commits the updated cursor artifact (.hedgeling/sync.json)
+#     back to the branch, so the stateHash short-circuit works on the NEXT
+#     run and pulls stay incremental. The commit message carries [skip ci]
+#     and the push rides the checkout's own credentials (the default
+#     GITHUB_TOKEN never triggers workflow runs — exactly right for a
+#     bookkeeping commit).
+#
+# Secrets: the console credential arrives as the `console-token` input wired
+# from repo secrets and reaches the CLI exclusively via
+# HEDGELING_CONSOLE_TOKEN — never echoed, never written to the JSON output.
+#
+# Permissions — push mode writes the cursor commit (`contents: write`); pull
+# mode is read-only in the repo (pair it with actions/translate, which owns
+# the PR delivery, rather than committing pull results directly).
+name: 'Hedgeling sync'
+description: >-
+  Run `hedgeling sync push|pull` — the one sanctioned transport between repo
+  state and the Hedgeling console — with CI retry/backoff on transport
+  failures and an automatic cursor-artifact commit after a push.
+
+inputs:
+  command:
+    description: >-
+      Which direction to sync: 'push' (repo state → console; run after merge
+      to the default branch) or 'pull' (console review verdicts + human edits
+      → repo state; usually via the translate action's `sync` input instead,
+      so the changes land in the localization PR).
+    required: false
+    default: 'push'
+  working-directory:
+    description: Workspace root holding .hedgeling/extract.config.json.
+    required: false
+    default: '.'
+  hedgeling-version:
+    description: >-
+      Override the @hedgeling/i18n version the action runs (any npm package
+      spec: a version, a dist-tag, or a file: path to a local checkout). The
+      default is pinned per action release.
+    required: false
+    default: '1.7.0'
+  npm-token:
+    description: >-
+      Token that lets this action install @hedgeling/i18n — wire from repo
+      secrets (e.g. from `secrets.HEDGELING_TOKEN`). A Hedgeling seat token
+      (`hdg_...`, from the Seats panel in the console) installs the package
+      from Hedgeling's registry; any other value is used as npm auth for the
+      job's default registry. Written as env-indirected auth into a scoped
+      .npmrc in RUNNER_TEMP used only by this action's npx calls — the token
+      value never lands on disk and is never echoed. Leave empty when the job
+      supplies its own .npmrc.
+    required: false
+    default: ''
+  console-token:
+    # NOTE: description strings are template-evaluated by the runner at
+    # action-load time, where the `secrets` context does not exist — a literal
+    # `${{ secrets.X }}` example here makes the action unloadable.
+    description: >-
+      Console service-account credential (hdlg_sa_…) — wire from repo secrets
+      (e.g. from `secrets.HEDGELING_CONSOLE_TOKEN`). Passed
+      to the CLI as HEDGELING_CONSOLE_TOKEN; never echoed. Push needs the
+      manage tier (imports.run + the state_imports entitlement), pull needs
+      strings.view — scope the account to what the workflow does.
+    required: false
+    default: ''
+  console-url:
+    description: >-
+      Console origin (e.g. https://console.example.com). Passed as `--origin`
+      (highest precedence). When empty the CLI resolves the committed cursor
+      artifact's consoleOrigin, then HEDGELING_CONSOLE_URL.
+    required: false
+    default: ''
+  project:
+    description: >-
+      Console project slug (`--project`). When empty the CLI resolves
+      projectSlug from .hedgeling/extract.config.json — the recommended place
+      for it.
+    required: false
+    default: ''
+  locales:
+    description: 'Pull only: comma-separated locales (`--locales`). A locale-filtered pull never advances the shared watermark.'
+    required: false
+    default: ''
+  glossary:
+    description: 'Pull only: glossary JSON overriding .hedgeling/glossary.json (`--glossary`) — pull-side validation uses the same effective glossary as the pipeline.'
+    required: false
+    default: ''
+  dry-run:
+    description: "Set to 'true' to print the merge plan without writing or pushing anything (`--dry-run`)."
+    required: false
+    default: 'false'
+  fail-on-conflicts:
+    description: >-
+      Pull only: when 'true' (default), exit 1 from the CLI (sync completed,
+      conflicts marked needs-review) fails the step so the workflow surfaces
+      them. Set 'false' to record conflicts in the outputs/summary and keep
+      the job green — e.g. when a later step delivers them for review.
+    required: false
+    default: 'true'
+  commit-cursor:
+    description: >-
+      Push only: when 'true' (default), commit an updated .hedgeling/sync.json
+      back to the current branch so the next run's stateHash short-circuit
+      and incremental pulls work. Requires `contents: write` and a checkout
+      with persisted credentials; set 'false' to handle the artifact yourself.
+    required: false
+    default: 'true'
+  max-attempts:
+    description: >-
+      Retry budget for exit 2 (configuration/transport failure). Attempts are
+      spaced by a linear backoff (retry-delay × attempt number). Conflicts
+      (exit 1) are never retried — the sync completed.
+    required: false
+    default: '3'
+  retry-delay:
+    description: Base seconds between retries (attempt n waits n × this).
+    required: false
+    default: '10'
+
+outputs:
+  outcome:
+    description: "'synced', 'unchanged' (idempotent no-op), 'conflicts', or 'dry-run'."
+    value: ${{ steps.sync.outputs.outcome }}
+  changed:
+    description: '"true" when the sync moved something (a real push, or pull changes applied).'
+    value: ${{ steps.sync.outputs.changed }}
+  conflicts:
+    description: Number of conflicts the pull classified (0 for push).
+    value: ${{ steps.sync.outputs.conflicts }}
+  stale-base:
+    description: >-
+      '"true" when the push applied but the console had last accepted a
+      DIFFERENT push than this repo''s cursor built on — another repo or
+      workflow is interleaving pushes into the same project. A warning, not a
+      failure (see "Monitoring the loop" in the README).'
+    value: ${{ steps.sync.outputs.stale-base }}
+  json-path:
+    description: >-
+      Path to the CLI's versioned JSON output (`--json` contract). Set only
+      when the CLI wrote a non-empty document; empty string otherwise (e.g. an
+      exit-2 configuration/transport failure that printed no report).
+    value: ${{ steps.sync.outputs.json-path }}
+  cursor-committed:
+    description: >-
+      Always "true" or "false": "true" only when a cursor-artifact commit was
+      pushed back to the branch; "false" on an unchanged run, when the commit
+      step is skipped (pull, dry-run, commit-cursor false, an earlier
+      failure), or when the commit/push failed.
+    value: ${{ steps.commit.outputs.cursor-committed || 'false' }}
+
+runs:
+  using: composite
+  steps:
+    - id: node
+      shell: bash
+      run: echo "present=$(command -v node >/dev/null 2>&1 && echo true || echo false)" >> "$GITHUB_OUTPUT"
+
+    - name: Setup Node.js
+      if: steps.node.outputs.present != 'true'
+      uses: actions/setup-node@v7
+      with:
+        node-version: '22'
+
+    # The CLI install is a PRECONDITION, not a result: resolve/install the
+    # package ONCE up front so a registry failure (a restricted version
+    # without auth, a 404, a network blip) surfaces as a configuration error
+    # (exit 2) — never as a sync failure. When npm-token is set, a scoped
+    # userconfig in RUNNER_TEMP carries the auth via npm's env indirection,
+    # so the token value never lands on disk; every npx call in this action
+    # points NPM_CONFIG_USERCONFIG at the same file.
+    - id: cli
+      shell: bash
+      env:
+        HEDGELING_VERSION: ${{ inputs.hedgeling-version }}
+        NPM_TOKEN: ${{ inputs.npm-token }}
+      run: |
+        set -e
+        userconfig=""
+        if [ -n "$NPM_TOKEN" ]; then
+          userconfig="$RUNNER_TEMP/hedgeling-npmrc"
+          # Single quotes on purpose: ${NPM_TOKEN} is npm's own env
+          # indirection, resolved by npm at read time — never by this shell.
+          case "$NPM_TOKEN" in
+            hdg_*)
+              # A seat token: the @hedgeling scope installs from Hedgeling's
+              # registry, and the token is sent nowhere else.
+              printf '@hedgeling:registry=https://platform.thehedgeling.com/registry/\n//platform.thehedgeling.com/registry/:_authToken=${NPM_TOKEN}\n' > "$userconfig"
+              ;;
+            *)
+              registry=$(npm config get registry)
+              registry="${registry%/}"
+              printf '//%s/:_authToken=${NPM_TOKEN}\n' "${registry#*://}" > "$userconfig"
+              ;;
+          esac
+        fi
+        echo "userconfig=$userconfig" >> "$GITHUB_OUTPUT"
+        # file: specs install nothing from a registry — nothing to preflight.
+        case "$HEDGELING_VERSION" in file:*) exit 0 ;; esac
+        if [ -n "$userconfig" ]; then export NPM_CONFIG_USERCONFIG="$userconfig"; fi
+        if ! npx --yes "@hedgeling/i18n@$HEDGELING_VERSION" --help >/dev/null 2>&1; then
+          echo "::error title=hedgeling sync::configuration error (exit 2) — could not install @hedgeling/i18n@$HEDGELING_VERSION from the npm registry; this is NOT a sync failure. Set the npm-token input to your Hedgeling seat token (hdg_..., wired from a secret), or supply a job-level .npmrc that can read the package."
+          exit 2
+        fi
+
+    - id: sync
+      shell: bash
+      env:
+        HEDGELING_VERSION: ${{ inputs.hedgeling-version }}
+        WORKING_DIRECTORY: ${{ inputs.working-directory }}
+        COMMAND: ${{ inputs.command }}
+        # The credential reaches the CLI only through env; when the input is
+        # empty the variable stays empty and the CLI's own credential check
+        # reports (exit 2, one actionable line).
+        HEDGELING_CONSOLE_TOKEN: ${{ inputs.console-token }}
+        CONSOLE_URL: ${{ inputs.console-url }}
+        PROJECT: ${{ inputs.project }}
+        LOCALES: ${{ inputs.locales }}
+        GLOSSARY: ${{ inputs.glossary }}
+        DRY_RUN: ${{ inputs.dry-run }}
+        FAIL_ON_CONFLICTS: ${{ inputs.fail-on-conflicts }}
+        MAX_ATTEMPTS: ${{ inputs.max-attempts }}
+        RETRY_DELAY: ${{ inputs.retry-delay }}
+        NPM_TOKEN: ${{ inputs.npm-token }}
+        HEDGELING_NPMRC: ${{ steps.cli.outputs.userconfig }}
+      run: |
+        set -e
+        # npm auth from the preflight (step `cli`), when configured.
+        if [ -n "$HEDGELING_NPMRC" ]; then export NPM_CONFIG_USERCONFIG="$HEDGELING_NPMRC"; fi
+        json="$RUNNER_TEMP/hedgeling-sync.json"
+        # Never inherit output from a previous invocation in the same job.
+        rm -f "$json"
+        if [ "$COMMAND" != "push" ] && [ "$COMMAND" != "pull" ]; then
+          echo "::error title=hedgeling sync::configuration error — command must be \"push\" or \"pull\", got \"$COMMAND\"."
+          exit 2
+        fi
+        if [ ! -d "$WORKING_DIRECTORY" ]; then
+          echo "::error title=hedgeling sync::configuration error — working-directory \"$WORKING_DIRECTORY\" does not exist in the checkout."
+          exit 2
+        fi
+        # The SAME command a developer runs. --json puts the versioned
+        # document on stdout (logs ride stderr), so outputs never parse logs.
+        args=(sync "$COMMAND" "$WORKING_DIRECTORY" --json)
+        [ -n "$CONSOLE_URL" ] && args+=(--origin "$CONSOLE_URL")
+        [ -n "$PROJECT" ] && args+=(--project "$PROJECT")
+        [ -n "$LOCALES" ] && args+=(--locales "$LOCALES")
+        [ -n "$GLOSSARY" ] && args+=(--glossary "$GLOSSARY")
+        [ "$DRY_RUN" = "true" ] && args+=(--dry-run)
+
+        # Retry discipline rides the CLI's exit-code contract: ONLY exit 2
+        # (configuration/transport — a flaky 502, a cold console) is retried,
+        # with linear backoff. Exit 1 means the sync COMPLETED and conflicts
+        # need a human: retrying cannot change the answer and never runs.
+        attempt=1
+        code=0
+        while :; do
+          code=0
+          npx --yes "@hedgeling/i18n@$HEDGELING_VERSION" "${args[@]}" > "$json" || code=$?
+          [ "$code" -ne 2 ] && break
+          [ "$attempt" -ge "$MAX_ATTEMPTS" ] && break
+          delay=$(( RETRY_DELAY * attempt ))
+          echo "::warning title=hedgeling sync::attempt $attempt/$MAX_ATTEMPTS failed (exit 2, configuration/transport) — retrying in ${delay}s."
+          sleep "$delay"
+          attempt=$(( attempt + 1 ))
+        done
+
+        # json-path names a report only when there IS one: an exit-2 failure
+        # can leave a zero-byte file, and a consumer must not be handed it.
+        if [ -s "$json" ]; then
+          echo "json-path=$json" >> "$GITHUB_OUTPUT"
+        else
+          echo "json-path=" >> "$GITHUB_OUTPUT"
+        fi
+        if [ "$code" -eq 2 ]; then
+          echo "::error title=hedgeling sync::configuration/transport failure (exit 2) after $attempt attempt(s) — check the console origin, the HEDGELING_CONSOLE_TOKEN secret, and the project slug."
+          exit 2
+        fi
+
+        # Outputs ride the versioned --json contract — never log parsing.
+        node -e '
+          const fs = require("node:fs");
+          const body = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+          const command = process.argv[2];
+          const dryRun = process.argv[3] === "true";
+          const conflicts = Array.isArray(body.conflicts) ? body.conflicts.length : 0;
+          const changed = command === "push"
+            // alreadyAccepted: the console already held this exact state (a
+            // prior push landed, its cursor did not) — nothing changed there.
+            ? body.pushed === true && body.alreadyAccepted !== true
+            : (body.applied ?? 0) > 0 || (dryRun && Array.isArray(body.actions) && body.actions.length > 0);
+          const staleBase = body.staleBase === true;
+          const outcome = dryRun ? "dry-run" : conflicts > 0 ? "conflicts" : changed ? "synced" : "unchanged";
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, `changed=${changed}\nconflicts=${conflicts}\nstale-base=${staleBase}\noutcome=${outcome}\n`);
+          // Last-writer detection (surfaced, never fatal): the push applied,
+          // but the console had accepted a different push than this repo
+          // cursor built on — two repos/workflows interleave into one project.
+          if (staleBase) {
+            console.log("::warning title=hedgeling sync::push applied, but the console last accepted a different push than this repo cursor builds on (stale base) — either another repo or workflow is pushing to this project (consolidate on one pushing workflow), or this repo previous cursor commit did not land (commit-cursor: false, a rejected cursor push; harmless). See Monitoring the loop in actions/sync/README.md.");
+          }
+        ' "$json" "$COMMAND" "$DRY_RUN"
+
+        if [ "$code" -eq 1 ]; then
+          if [ "$FAIL_ON_CONFLICTS" = "true" ]; then
+            echo "::error title=hedgeling sync::sync completed with conflicts (exit 1) — repo text kept, entries marked needs-review. Resolve them in the console review queue; the conflict runbook lives in actions/sync/README.md."
+            exit 1
+          fi
+          echo "::warning title=hedgeling sync::sync completed with conflicts — repo text kept, entries marked needs-review; resolve in the console review queue."
+        fi
+
+    - id: commit
+      if: inputs.command == 'push' && inputs.commit-cursor == 'true' && inputs.dry-run != 'true'
+      shell: bash
+      env:
+        WORKING_DIRECTORY: ${{ inputs.working-directory }}
+      run: |
+        set -e
+        cursor="$WORKING_DIRECTORY/.hedgeling/sync.json"
+        # The cursor only changes when the push actually moved something (the
+        # stateHash short-circuit writes nothing) — an unchanged artifact
+        # means an idempotent no-op run and no bookkeeping commit.
+        if [ -z "$(git status --porcelain -- "$cursor")" ]; then
+          echo "cursor-committed=false" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+        git config user.name "github-actions[bot]"
+        git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+        git add -- "$cursor"
+        # --no-verify: the artifact is canonical machine-generated JSON — a
+        # hook reformatting it would break the zero-diff idempotency pin.
+        # [skip ci]: a bookkeeping commit must never trigger another workflow
+        # cycle (the default GITHUB_TOKEN would not anyway; a PAT would).
+        git commit --no-verify -m "chore(i18n): record hedgeling sync cursor [skip ci]"
+        # A concurrent push to the branch (merge queue, another run) must not
+        # fail the sync: rebase onto the moved head and retry. The cursor
+        # commit touches only .hedgeling/sync.json, so the rebase is clean
+        # unless another sync push raced — in which case ITS cursor already
+        # carries a newer stateHash and losing this race is harmless.
+        branch="${GITHUB_REF_NAME:?}"
+        for attempt in 1 2 3; do
+          if git push origin "HEAD:refs/heads/$branch"; then
+            echo "cursor-committed=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git fetch --no-tags origin "refs/heads/$branch"
+          git rebase FETCH_HEAD
+        done
+        echo "::error title=hedgeling sync::could not push the sync-cursor commit to $branch after 3 attempts — if $branch is a protected branch set commit-cursor: 'false' and deliver .hedgeling/sync.json through your PR flow (see the Branch protection section of actions/sync/README.md); otherwise commit the artifact manually."
+        exit 1
+
+    - name: Job summary
+      if: always()
+      shell: bash
+      env:
+        COMMAND: ${{ inputs.command }}
+        OUTCOME: ${{ steps.sync.outputs.outcome }}
+        CONFLICTS: ${{ steps.sync.outputs.conflicts }}
+        STALE_BASE: ${{ steps.sync.outputs.stale-base }}
+        CURSOR_COMMITTED: ${{ steps.commit.outputs.cursor-committed }}
+      run: |
+        # `if` guards, not bare `[ ... ] && …` — see the translate action's
+        # summary-step regression (a false last test fails the whole step).
+        if [ -n "$OUTCOME" ]; then
+          {
+            echo "## Hedgeling sync $COMMAND"
+            echo ""
+            echo "- outcome: **$OUTCOME**"
+            if [ -n "$CONFLICTS" ] && [ "$CONFLICTS" != "0" ]; then
+              echo "- conflicts: **$CONFLICTS** (marked needs-review — resolve in the console review queue)"
+            fi
+            if [ "$STALE_BASE" = "true" ]; then
+              echo "- stale base: **the console last accepted a different push than this repo's cursor builds on** — another repo/workflow is pushing to this project, or this repo's previous cursor commit did not land (see Monitoring the loop in actions/sync/README.md)"
+            fi
+            if [ -n "$CURSOR_COMMITTED" ]; then
+              echo "- cursor commit pushed: $CURSOR_COMMITTED"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+        fi

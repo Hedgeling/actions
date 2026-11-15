@@ -1,0 +1,59 @@
+# P-07 / v1.3.0 spec 05: copy-paste CI gate for projects using @hedgeling/i18n.
+#
+# Copy this file into your repo's .github/workflows/ directory (files inside
+# examples/ subfolders are never executed by GitHub Actions). One step gives
+# the PR inline annotations on INTRODUCED findings, a localization impact job
+# summary, and a pass/fail status:
+#   - someone adds UI copy without running `hedgeling extract --write` and
+#     committing the catalog (drift check — always on),
+#   - a release-blocking i18n gap is introduced (`fail-on: required`),
+#   - any locale exceeds the untranslated budget (`max-untranslated`),
+#   - unreviewed translations would ship (`require-verified`, optional),
+#   - a committed artifact was written by a newer toolchain (`schema`).
+#
+# `hedgeling check` is read-only: it never writes the catalog, state, or
+# bundle, so this job needs no write permissions beyond `contents: read`.
+# Exit codes: 0 = pass, 1 = check failure, 2 = configuration/internal error.
+name: Hedgeling i18n check
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  hedgeling-check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      # Zero config required: on pull_request events `base` defaults to the
+      # PR base SHA, so gates and annotations apply to introduced findings
+      # only. Every input below is optional — drop the ones you don't want.
+      - name: Hedgeling check
+        uses: Hedgeling/actions/check@v1
+        with:
+          schema: true
+          fail-on: required
+          max-untranslated: 5%
+          # require-verified: fr-FR,de-DE   # also block unreviewed translations
+          # allow-new: true                 # downgrade new strings while onboarding
+
+      # Raw-CLI variant (GitLab-style environments, or runners without
+      # marketplace access) — the same gate without the action:
+      #
+      # - name: Setup Node.js
+      #   uses: actions/setup-node@v7
+      #   with:
+      #     node-version: '22'
+      # - name: Hedgeling check
+      #   run: |
+      #     npm ci
+      #     npx hedgeling check --github --schema --fail-on required \
+      #       --max-untranslated 5% --base "${{ github.event.pull_request.base.sha }}" \
+      #       --summary "$RUNNER_TEMP/hedgeling-summary.md"
+      # - name: Job summary
+      #   if: always()
+      #   run: cat "$RUNNER_TEMP/hedgeling-summary.md" >> "$GITHUB_STEP_SUMMARY"

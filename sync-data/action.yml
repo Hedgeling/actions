@@ -1,0 +1,805 @@
+# dynamic-data spec 07: the closed git loop for dynamic content. A COMPOSITE
+# action (like actions/check, actions/translate, actions/sync): every loop law
+# lives in the CLI — fetch/diff/translate/prune in `sync-data`, the merge law
+# in `sync pull|push`, the commit scope in `localize-plan` — and this file
+# carries only CI ergonomics. The trigger is cron (API churn, not commits), so
+# the caller schedules it; the order within a run is fixed:
+#
+#   pull → sync-data → commit → sync push → publish
+#
+# - pull FIRST so human verifications land before recompile (one cycle, not
+#   two, from console approval to served translation). Pull conflicts (exit 1)
+#   are reported but never abort — conflicts wait for humans, data keeps
+#   flowing. Transport failure (exit 2) aborts BEFORE any commit.
+# - DIRECT commit to the branch — no localization PR. Dynamic batches are
+#   high-frequency, validator-gated, additive, and reviewed ASYNCHRONOUSLY in
+#   the console; a PR per cron tick is bookkeeping noise. Safety is preserved
+#   by `localize-plan`: the commit step refuses when ANY dirty path is not a
+#   committable Hedgeling artifact, so the action can never sweep unrelated
+#   changes into its commit. The push reuses the bot-token override and the
+#   rebase-and-retry discipline from actions/translate + actions/sync.
+# - budget-stopped runs (sync-data exit 2) still COMMIT and push what was
+#   completed — cataloged-untranslated entries are valid state and the data
+#   cursor was deliberately not advanced, so the next tick resumes. The run
+#   stays green with a warning annotation carrying the report counts.
+# - publish runs LAST, only after commit + sync push succeed, and only when
+#   the dynamic bundle bytes changed. Git state remains the source of truth;
+#   the published bundle is a derived, reproducible artifact. No
+#   publish-command ⇒ step skipped (the bundle serves from the deployed repo
+#   copy — translations then ride deploys; degraded but correct). Exception:
+#   `external`-retention sources REQUIRE a publish command (the CLI validates
+#   this) — their bundles are never committed, so publish is the only
+#   delivery path.
+#
+# Concurrency — give the calling workflow its OWN `concurrency:` group
+# (conventionally `hedgeling-sync-data`), never one shared with
+# actions/translate and actions/sync: GitHub keeps one pending run per group
+# and cancels the older pending run when another queues, which in a shared
+# group drops a different writer's run (soak #32). Overlapping writers are
+# safe: commits rebase-and-retry, and the sync push's staleBase lineage check
+# is the console-side backstop — surfaced as a warning, the publish step is
+# skipped for that tick, and the next tick self-heals from the fresh checkout.
+#
+# Secrets: the console token and any API credentials arrive as workflow
+# secrets → env (the spec-01 `env:` indirection for adapter auth). The action
+# never writes them to any artifact — same law as the sync cursor ("no tokens
+# EVER") — and never puts them on argv.
+#
+# Permissions: contents: write (the direct artifact commit).
+name: 'Hedgeling sync data'
+description: >-
+  Run one tick of the cron-driven dynamic-content loop: `hedgeling sync pull`
+  (console truth in first), `hedgeling sync-data` (fetch Δ, translate,
+  recompile), a scoped direct commit of the Hedgeling artifacts, `hedgeling
+  sync push` (console rows), and a conditional publish of the dynamic bundle.
+
+inputs:
+  working-directory:
+    description: Workspace root holding .hedgeling/extract.config.json.
+    required: false
+    default: '.'
+  hedgeling-version:
+    description: >-
+      Override the @hedgeling/i18n version the action runs (any npm package
+      spec: a version, a dist-tag, or a file: path to a local checkout). The
+      default is pinned per action release.
+    required: false
+    default: '1.7.0'
+  npm-token:
+    description: >-
+      Token that lets this action install @hedgeling/i18n — wire from repo
+      secrets (e.g. from `secrets.HEDGELING_TOKEN`). A Hedgeling seat token
+      (`hdg_...`, from the Seats panel in the console) installs the package
+      from Hedgeling's registry; any other value is used as npm auth for the
+      job's default registry. Written as env-indirected auth into a scoped
+      .npmrc in RUNNER_TEMP used only by this action's npx calls — the token
+      value never lands on disk and is never echoed. Leave empty when the job
+      supplies its own .npmrc.
+    required: false
+    default: ''
+  sources:
+    description: >-
+      Comma-separated subset of the configured dataSources to sync (each runs
+      as `sync-data --source <name>`). Empty (the default) syncs every
+      configured source in one run.
+    required: false
+    default: ''
+  budget-strings:
+    description: >-
+      Per-source translation budget override (`--budget-strings`). Empty uses
+      the config's dynamicBudgetStrings. Budget-stopped sources are committed
+      as cataloged-untranslated and resume next tick; repeated budget-stop
+      warnings are the signal to raise the budget or tighten fields.
+    required: false
+    default: ''
+  publish-command:
+    description: >-
+      Shell command that uploads the compiled dynamic bundle to where the
+      spec-04 runtime loads it (e.g. a one-line `supabase storage cp` / `aws
+      s3 cp`). Runs LAST, only after commit and sync push succeed and only
+      when the bundle bytes changed; the bundle path is in
+      $HEDGELING_DYNAMIC_BUNDLE. Empty skips publishing (the bundle then
+      serves from the deployed repo copy and translations ride deploys).
+      REQUIRED when any source declares retention "external".
+    required: false
+    default: ''
+  console-token:
+    # NOTE: description strings are template-evaluated by the runner at
+    # action-load time, where the `secrets` context does not exist — a literal
+    # `${{ secrets.X }}` example here makes the action unloadable.
+    description: >-
+      Console service-account credential (hdlg_sa_…) — wire from repo secrets
+      (e.g. from `secrets.HEDGELING_CONSOLE_TOKEN`). Passed
+      to the CLI as HEDGELING_CONSOLE_TOKEN; never echoed, never written to
+      any artifact. The loop pulls (strings.view), pushes (imports.run + the
+      state_imports entitlement), and stores external-retention text — scope
+      the account to what the project's sources need.
+    required: false
+    default: ''
+  console-url:
+    description: >-
+      Console origin (e.g. https://console.example.com). Passed as `--origin`
+      (highest precedence). When empty the CLI resolves the committed cursor
+      artifact's consoleOrigin, then HEDGELING_CONSOLE_URL.
+    required: false
+    default: ''
+  project:
+    description: >-
+      Console project slug (`--project`). When empty the CLI resolves
+      projectSlug from .hedgeling/extract.config.json — the recommended place
+      for it.
+    required: false
+    default: ''
+  token:
+    description: >-
+      Token used to push the direct artifact commit. Defaults to the
+      checkout's persisted credentials (the job's GITHUB_TOKEN). The commit
+      message carries [skip ci], so a PAT/App token here does not recurse;
+      when set and origin is HTTP(S), the push authenticates with this token
+      for that one command (checkout's persisted credentials are overridden,
+      never rewritten) — same discipline as the translate action's branch
+      push.
+    required: false
+    default: ''
+  max-attempts:
+    description: >-
+      Retry budget for exit 2 on the sync pull/push transport (a flaky 502
+      must not fail a cron tick). Attempts are spaced by a linear backoff
+      (retry-delay × attempt number). Pull conflicts (exit 1) are never
+      retried — the sync completed and the conflicts wait for humans.
+    required: false
+    default: '3'
+  retry-delay:
+    description: Base seconds between retries (attempt n waits n × this).
+    required: false
+    default: '10'
+
+outputs:
+  budget-stopped:
+    description: '"true" when any source stopped at the translation budget (committed anyway; the held cursor resumes next tick).'
+    value: ${{ steps.sync-data.outputs.budget-stopped }}
+  bundle-changed:
+    description: '"true" when the run changed the dynamic bundle bytes (the publish gate).'
+    value: ${{ steps.sync-data.outputs.bundle-changed }}
+  json-path:
+    description: Path to the sync-data run report(s) (`--json` contract; an array for multi-source runs). Set only when the report is non-empty; empty string otherwise.
+    value: ${{ steps.sync-data.outputs.json-path }}
+  pull-conflicts:
+    description: Conflicts the opening `sync pull` classified (repo text kept, entries marked needs-review — they never fail the tick).
+    value: ${{ steps.pull.outputs.conflicts }}
+  committed:
+    description: '"true" when the tick produced an artifact diff and the direct commit was pushed; "false" on the no-op path.'
+    value: ${{ steps.commit.outputs.committed }}
+  stale-base:
+    description: '"true" when the closing `sync push` detected an out-of-band writer (publish is skipped for the tick; the next tick self-heals).'
+    value: ${{ steps.push.outputs.stale-base }}
+  published:
+    description: '"true" when the publish command ran (bundle bytes changed, commit + push succeeded); empty when the step was skipped.'
+    value: ${{ steps.publish.outputs.published }}
+
+runs:
+  using: composite
+  steps:
+    - id: node
+      shell: bash
+      run: echo "present=$(command -v node >/dev/null 2>&1 && echo true || echo false)" >> "$GITHUB_OUTPUT"
+
+    - name: Setup Node.js
+      if: steps.node.outputs.present != 'true'
+      uses: actions/setup-node@v7
+      with:
+        node-version: '22'
+
+    # The CLI install is a PRECONDITION, not a result: resolve/install the
+    # package ONCE up front so a registry failure (a restricted version
+    # without auth, a 404, a network blip) surfaces as a configuration error
+    # (exit 2) that aborts the tick BEFORE any write — never as a data-sync
+    # failure. When npm-token is set, a scoped userconfig in RUNNER_TEMP
+    # carries the auth via npm's env indirection, so the token value never
+    # lands on disk; every npx call in this action points
+    # NPM_CONFIG_USERCONFIG at the same file.
+    - id: cli
+      shell: bash
+      env:
+        HEDGELING_VERSION: ${{ inputs.hedgeling-version }}
+        NPM_TOKEN: ${{ inputs.npm-token }}
+        # A seat token also tells the CLI which plan's limits apply.
+        HEDGELING_TOKEN: ${{ startsWith(inputs.npm-token, 'hdg_') && inputs.npm-token || env.HEDGELING_TOKEN }}
+      run: |
+        set -e
+        userconfig=""
+        if [ -n "$NPM_TOKEN" ]; then
+          userconfig="$RUNNER_TEMP/hedgeling-npmrc"
+          # Single quotes on purpose: ${NPM_TOKEN} is npm's own env
+          # indirection, resolved by npm at read time — never by this shell.
+          case "$NPM_TOKEN" in
+            hdg_*)
+              # A seat token: the @hedgeling scope installs from Hedgeling's
+              # registry, and the token is sent nowhere else.
+              printf '@hedgeling:registry=https://platform.thehedgeling.com/registry/\n//platform.thehedgeling.com/registry/:_authToken=${NPM_TOKEN}\n' > "$userconfig"
+              ;;
+            *)
+              registry=$(npm config get registry)
+              registry="${registry%/}"
+              printf '//%s/:_authToken=${NPM_TOKEN}\n' "${registry#*://}" > "$userconfig"
+              ;;
+          esac
+        fi
+        echo "userconfig=$userconfig" >> "$GITHUB_OUTPUT"
+        # file: specs install nothing from a registry — nothing to preflight.
+        case "$HEDGELING_VERSION" in file:*) exit 0 ;; esac
+        if [ -n "$userconfig" ]; then export NPM_CONFIG_USERCONFIG="$userconfig"; fi
+        if ! npx --yes "@hedgeling/i18n@$HEDGELING_VERSION" --help >/dev/null 2>&1; then
+          echo "::error title=hedgeling sync-data::configuration error (exit 2) — could not install @hedgeling/i18n@$HEDGELING_VERSION from the npm registry; aborting this tick before any write or commit. Set the npm-token input to your Hedgeling seat token (hdg_..., wired from a secret), or supply a job-level .npmrc that can read the package."
+          exit 2
+        fi
+
+    # Fresh head FIRST (soak #34): a run that waited in the concurrency queue
+    # (or a cron tick that fired while the previous tick still ran) was checked
+    # out at the commit that TRIGGERED it, not the branch head when its job
+    # starts. Working from that stale commit redoes the previous tick's work
+    # and then conflicts on push. Fast-forward to the current head before
+    # anything reads or writes; a non-fast-forward (rewritten branch) or a
+    # failed fetch only warns — the push path still fails cleanly, and the next
+    # tick self-heals.
+    - id: head
+      shell: bash
+      run: |
+        set -e
+        case "${GITHUB_REF:-}" in
+          refs/heads/*) ;;
+          *) exit 0 ;;
+        esac
+        branch="${GITHUB_REF_NAME:?}"
+        before=$(git rev-parse HEAD)
+        if ! git fetch --no-tags origin "refs/heads/$branch"; then
+          echo "::warning title=hedgeling sync-data::could not fetch $branch to check for newer commits — continuing from the triggering commit ${before:0:7}."
+          exit 0
+        fi
+        head=$(git rev-parse FETCH_HEAD)
+        [ "$head" = "$before" ] && exit 0
+        if git merge-base --is-ancestor HEAD FETCH_HEAD && git merge --ff-only --quiet FETCH_HEAD; then
+          echo "::notice title=hedgeling sync-data::$branch moved after this run was triggered (it queued behind an earlier tick?) — fast-forwarded ${before:0:7} → ${head:0:7} so the tick works from the current head."
+        else
+          echo "::warning title=hedgeling sync-data::$branch at ${head:0:7} is not a fast-forward of the triggering commit ${before:0:7} (history rewritten?) — continuing from the triggering commit; a conflicting push fails cleanly and the next tick self-heals."
+        fi
+
+    # Pull FIRST: human truth lands before recompile, so a console
+    # verification reaches the served bundle in ONE cycle. Exit 1 (conflicts)
+    # is a warning — conflicts wait for humans, data keeps flowing. Exit 2
+    # (transport) aborts the tick BEFORE anything is written or committed.
+    - id: pull
+      shell: bash
+      env:
+        HEDGELING_VERSION: ${{ inputs.hedgeling-version }}
+        WORKING_DIRECTORY: ${{ inputs.working-directory }}
+        HEDGELING_CONSOLE_TOKEN: ${{ inputs.console-token }}
+        CONSOLE_URL: ${{ inputs.console-url }}
+        PROJECT: ${{ inputs.project }}
+        MAX_ATTEMPTS: ${{ inputs.max-attempts }}
+        RETRY_DELAY: ${{ inputs.retry-delay }}
+        NPM_TOKEN: ${{ inputs.npm-token }}
+        # A seat token also tells the CLI which plan's limits apply.
+        HEDGELING_TOKEN: ${{ startsWith(inputs.npm-token, 'hdg_') && inputs.npm-token || env.HEDGELING_TOKEN }}
+        HEDGELING_NPMRC: ${{ steps.cli.outputs.userconfig }}
+      run: |
+        set -e
+        # npm auth from the preflight (step `cli`), when configured.
+        if [ -n "$HEDGELING_NPMRC" ]; then export NPM_CONFIG_USERCONFIG="$HEDGELING_NPMRC"; fi
+        if [ ! -d "$WORKING_DIRECTORY" ]; then
+          echo "::error title=hedgeling sync-data::configuration error — working-directory \"$WORKING_DIRECTORY\" does not exist in the checkout."
+          exit 2
+        fi
+        json="$RUNNER_TEMP/hedgeling-sync-data-pull.json"
+        rm -f "$json"
+        args=(sync pull "$WORKING_DIRECTORY" --json)
+        [ -n "$CONSOLE_URL" ] && args+=(--origin "$CONSOLE_URL")
+        [ -n "$PROJECT" ] && args+=(--project "$PROJECT")
+        # Retry ONLY exit 2 (configuration/transport) with linear backoff.
+        attempt=1
+        code=0
+        while :; do
+          code=0
+          npx --yes "@hedgeling/i18n@$HEDGELING_VERSION" "${args[@]}" > "$json" || code=$?
+          [ "$code" -ne 2 ] && break
+          [ "$attempt" -ge "$MAX_ATTEMPTS" ] && break
+          delay=$(( RETRY_DELAY * attempt ))
+          echo "::warning title=hedgeling sync-data pull::attempt $attempt/$MAX_ATTEMPTS failed (exit 2, configuration/transport) — retrying in ${delay}s."
+          sleep "$delay"
+          attempt=$(( attempt + 1 ))
+        done
+        if [ "$code" -eq 2 ]; then
+          echo "::error title=hedgeling sync-data pull::configuration/transport failure (exit 2) after $attempt attempt(s) — aborting this tick before any write or commit; check the console origin, the console-token secret, and the project slug."
+          exit 2
+        fi
+        # Exit 0/1 always carries the versioned --json document; anything else
+        # (or an unparseable file) means the CLI itself never ran — e.g. an
+        # npx install/network failure (exit 127/1 with no JSON). Fail loudly
+        # instead of letting a node stack trace (or a green step) stand in.
+        if ! node -e '
+          const fs = require("node:fs");
+          const body = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+          const conflicts = Array.isArray(body.conflicts) ? body.conflicts.length : 0;
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, `conflicts=${conflicts}\napplied=${body.applied ?? 0}\n`);
+        ' "$json" 2>/dev/null; then
+          echo "::error title=hedgeling sync-data pull::pull exited $code without a parseable report — the CLI itself failed to run (npx install/network failure?); aborting this tick before any write or commit."
+          exit 1
+        fi
+        if [ "$code" -eq 1 ]; then
+          echo "::warning title=hedgeling sync-data pull::pull completed with conflicts — repo text kept, entries marked needs-review; conflicts wait for humans in the console, data keeps flowing."
+        fi
+
+    # The cycle itself: fetch Δ, select/mask/hash, translate within the
+    # budget, prune, recompile. Exit 2 (budget-stopped) keeps the tick GREEN:
+    # what completed is valid state, the data cursor was deliberately held,
+    # and the next tick resumes — surfaced by the warning annotation, never
+    # hidden. Exit 1 is a real failure and aborts before any commit.
+    - id: sync-data
+      shell: bash
+      env:
+        HEDGELING_VERSION: ${{ inputs.hedgeling-version }}
+        WORKING_DIRECTORY: ${{ inputs.working-directory }}
+        HEDGELING_CONSOLE_TOKEN: ${{ inputs.console-token }}
+        CONSOLE_URL: ${{ inputs.console-url }}
+        PROJECT: ${{ inputs.project }}
+        SOURCES: ${{ inputs.sources }}
+        BUDGET_STRINGS: ${{ inputs.budget-strings }}
+        NPM_TOKEN: ${{ inputs.npm-token }}
+        # A seat token also tells the CLI which plan's limits apply.
+        HEDGELING_TOKEN: ${{ startsWith(inputs.npm-token, 'hdg_') && inputs.npm-token || env.HEDGELING_TOKEN }}
+        HEDGELING_NPMRC: ${{ steps.cli.outputs.userconfig }}
+      run: |
+        set -e
+        # npm auth from the preflight (step `cli`), when configured.
+        if [ -n "$HEDGELING_NPMRC" ]; then export NPM_CONFIG_USERCONFIG="$HEDGELING_NPMRC"; fi
+        # The publish gate measures CONTENT against the COMMITTED baseline:
+        # - content: the bundle stamp (.hedgeling/dynamic-bundle-stamp.json,
+        #   written by every compile) carries the bundle's content hash.
+        #   Hashing the bundle FILE broke for external retention (soak #26):
+        #   that bundle is never in the checkout, so it always read "changed"
+        #   and republished every tick. The file hash remains the fallback for
+        #   a checkout from a toolchain that predates the stamp.
+        # - baseline: HEAD (the checkout), never the working tree at this
+        #   step's start — the pull step has already recompiled the bundle
+        #   with any pulled console verdicts, so a working-tree baseline made a
+        #   verified edit read "unchanged" and it was never published (soak
+        #   #27). Nothing commits before the commit step, so HEAD is exactly
+        #   what was last published (or, for a failed publish, last compiled).
+        # The bundle path mirrors the CLI's resolution: dynamicBundlePath from
+        # the config, else the default filename at the workspace root.
+        bundle_path=$(node -e '
+          const fs = require("node:fs"), path = require("node:path");
+          const wd = process.argv[1];
+          let rel = "hedgeling-dynamic-bundle.json";
+          try {
+            const cfg = JSON.parse(fs.readFileSync(path.join(wd, ".hedgeling", "extract.config.json"), "utf8"));
+            if (typeof cfg.dynamicBundlePath === "string" && cfg.dynamicBundlePath.trim()) rel = cfg.dynamicBundlePath;
+          } catch {}
+          process.stdout.write(path.resolve(wd, rel));
+        ' "$WORKING_DIRECTORY")
+        stamp_dir="$WORKING_DIRECTORY/.hedgeling"
+        stamp_name="dynamic-bundle-stamp.json"
+        bundle_dir=$(dirname "$bundle_path")
+        bundle_name=$(basename "$bundle_path")
+        stamp_hash() { node -e 'let t = ""; process.stdin.on("data", (d) => (t += d)).on("end", () => { try { const s = JSON.parse(t); process.stdout.write(typeof s.contentHash === "string" ? `stamp:${s.contentHash}` : "stamp:invalid"); } catch { process.stdout.write("stamp:invalid"); } });'; }
+        # Baseline: the COMMITTED stamp/bundle (HEAD), read with git so nothing
+        # an earlier step wrote can leak into it. `HEAD:./x` is relative to -C.
+        committed_hash() {
+          if [ -d "$stamp_dir" ] && git -C "$stamp_dir" cat-file -e "HEAD:./$stamp_name" 2>/dev/null; then
+            git -C "$stamp_dir" show "HEAD:./$stamp_name" | stamp_hash
+          elif [ -d "$bundle_dir" ] && git -C "$bundle_dir" cat-file -e "HEAD:./$bundle_name" 2>/dev/null; then
+            git -C "$bundle_dir" rev-parse "HEAD:./$bundle_name"
+          else
+            echo absent
+          fi
+        }
+        hash_bundle() {
+          if [ -f "$stamp_dir/$stamp_name" ]; then
+            stamp_hash < "$stamp_dir/$stamp_name"
+          elif [ -f "$bundle_path" ]; then
+            git hash-object "$bundle_path"
+          else
+            echo absent
+          fi
+        }
+        before=$(committed_hash)
+
+        base_args=(sync-data "$WORKING_DIRECTORY" --json)
+        [ -n "$CONSOLE_URL" ] && base_args+=(--origin "$CONSOLE_URL")
+        [ -n "$PROJECT" ] && base_args+=(--project "$PROJECT")
+        [ -n "$BUDGET_STRINGS" ] && base_args+=(--budget-strings "$BUDGET_STRINGS")
+
+        combined="$RUNNER_TEMP/hedgeling-sync-data.json"
+        rm -f "$combined"
+        code=0
+        unreported_source=""
+        if [ -z "$SOURCES" ]; then
+          npx --yes "@hedgeling/i18n@$HEDGELING_VERSION" "${base_args[@]}" > "$combined" || code=$?
+        else
+          parts=()
+          IFS=',' read -ra names <<< "$SOURCES"
+          for name in "${names[@]}"; do
+            name=$(echo "$name" | tr -d '[:space:]')
+            [ -z "$name" ] && continue
+            part="$RUNNER_TEMP/hedgeling-sync-data-$name.json"
+            source_code=0
+            npx --yes "@hedgeling/i18n@$HEDGELING_VERSION" "${base_args[@]}" --source "$name" > "$part" || source_code=$?
+            # Only 0 (complete) and 2 (budget-stopped) continue the tick; 1 is
+            # a real failure and ANY other code (127 npx meltdown, a signal)
+            # must never fall through to a green step.
+            if [ "$source_code" -ne 0 ] && [ "$source_code" -ne 2 ]; then code=$source_code; break; fi
+            # Exit 2 with NO parseable report is the configuration/transport
+            # class (feed unreachable or timed out, missing console
+            # credentials) — never let another source's budget-stop report
+            # turn this tick green.
+            if [ "$source_code" -eq 2 ] && ! node -e 'JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8"))' "$part" 2>/dev/null; then
+              unreported_source="$name"; code=2; break
+            fi
+            [ "$source_code" -eq 2 ] && code=2
+            parts+=("$part")
+          done
+          # One JSON document, same shape as the CLI's multi-source run. A
+          # part without a parseable report (an exit-2 configuration failure
+          # writes nothing) is skipped here and caught by the exit-2 gate
+          # below — the merge must not die on it with a bare stack trace.
+          if [ "$code" -eq 0 ] || [ "$code" -eq 2 ]; then
+            node -e '
+              const fs = require("node:fs");
+              const reports = process.argv.slice(2).flatMap((p) => {
+                let body;
+                try { body = JSON.parse(fs.readFileSync(p, "utf8")); } catch { return []; }
+                return Array.isArray(body) ? body : [body];
+              });
+              fs.writeFileSync(process.argv[1], JSON.stringify(reports.length === 1 ? reports[0] : reports, null, 2));
+            ' "$combined" "${parts[@]}"
+          fi
+        fi
+
+        # json-path names a report only when there IS one: a failed run can
+        # leave a zero-byte file, and a consumer must not be handed it.
+        if [ -s "$combined" ]; then
+          echo "json-path=$combined" >> "$GITHUB_OUTPUT"
+        else
+          echo "json-path=" >> "$GITHUB_OUTPUT"
+        fi
+        echo "bundle-path=$bundle_path" >> "$GITHUB_OUTPUT"
+        if [ "$code" -ne 0 ] && [ "$code" -ne 2 ]; then
+          echo "::error title=hedgeling sync-data::sync-data failed (exit $code) — aborting this tick before any commit; see the step log for the failing source."
+          exit 1
+        fi
+
+        after=$(hash_bundle)
+        if [ "$before" != "$after" ]; then
+          echo "bundle-changed=true" >> "$GITHUB_OUTPUT"
+        else
+          echo "bundle-changed=false" >> "$GITHUB_OUTPUT"
+        fi
+
+        # Budget-stop stays GREEN: what completed is valid, the held cursor
+        # resumes next tick. The warning annotation carries the report counts
+        # so repeated budget stops are visible to the operator. BUT exit 2
+        # without a budget-stopped report is the CLI's configuration path
+        # (e.g. missing console credentials for external-retention sources,
+        # which writes no report at all) — that is a real failure, not a
+        # budget stop, and must never commit as if work completed.
+        if [ "$code" -eq 2 ] && [ -n "$unreported_source" ]; then
+          echo "budget-stopped=false" >> "$GITHUB_OUTPUT"
+          echo "::error title=hedgeling sync-data::sync-data --source $unreported_source exited 2 without a report — a configuration/transport failure (the data source feed unreachable or timed out, or console credentials/origin for external retention); aborting this tick before any commit."
+          exit 2
+        elif [ "$code" -eq 2 ]; then
+          if node -e '
+            const fs = require("node:fs");
+            let body;
+            try { body = JSON.parse(fs.readFileSync(process.argv[1], "utf8")); } catch { process.exit(1); }
+            const reports = Array.isArray(body) ? body : [body];
+            const stopped = reports.filter((r) => r && r.budgetStopped).map((r) => r.source);
+            if (stopped.length === 0) process.exit(1);
+            const sum = (key) => reports.reduce((n, r) => n + (r[key] ?? 0), 0);
+            console.log(
+              `::warning title=hedgeling sync-data::budget-stopped (${stopped.join(", ")}) — ` +
+                `${sum("newEntries")} new entr(ies) cataloged (${sum("translated")} translated this run); ` +
+                `completed work commits and the held cursor resumes next tick. ` +
+                `Repeated budget stops: raise dynamicBudgetStrings/budget-strings or tighten the source fields.`,
+            );
+          ' "$combined"; then
+            echo "budget-stopped=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "budget-stopped=false" >> "$GITHUB_OUTPUT"
+            echo "::error title=hedgeling sync-data::sync-data exited 2 without a budget-stopped report — a configuration/transport failure (console credentials/origin for external-retention sources, the data source's own config, or its feed unreachable/timed out — see HEDGELING_FEED_TIMEOUT_MS); aborting this tick before any commit."
+            exit 2
+          fi
+        else
+          echo "budget-stopped=false" >> "$GITHUB_OUTPUT"
+        fi
+
+    # Direct commit to the branch — no localization PR (a PR per cron tick is
+    # bookkeeping noise; review happens asynchronously in the console). The
+    # commit is gated by `localize-plan`: ANY dirty path outside the
+    # committable Hedgeling artifact set (state, data cursor, sync cursor,
+    # dynamic bundle, …) refuses the whole commit, so unrelated changes are
+    # never swept in. A quiet tick (noop / metadata-only diff) commits nothing,
+    # except a bounded heartbeat (at most one per 2x dynamicSyncCadenceHours).
+    - id: commit
+      shell: bash
+      env:
+        HEDGELING_VERSION: ${{ inputs.hedgeling-version }}
+        WORKING_DIRECTORY: ${{ inputs.working-directory }}
+        BOT_TOKEN: ${{ inputs.token }}
+        NPM_TOKEN: ${{ inputs.npm-token }}
+        # A seat token also tells the CLI which plan's limits apply.
+        HEDGELING_TOKEN: ${{ startsWith(inputs.npm-token, 'hdg_') && inputs.npm-token || env.HEDGELING_TOKEN }}
+        HEDGELING_NPMRC: ${{ steps.cli.outputs.userconfig }}
+      run: |
+        set -e
+        # npm auth from the preflight (step `cli`), when configured.
+        if [ -n "$HEDGELING_NPMRC" ]; then export NPM_CONFIG_USERCONFIG="$HEDGELING_NPMRC"; fi
+        plan_file="$RUNNER_TEMP/hedgeling-sync-data-plan.json"
+        # --heartbeat (soak #22): a quiet tick commits nothing UNLESS the committed
+        # cursor/report ring is older than 2x dynamicSyncCadenceHours — then its
+        # metadata-only diff commits, so doctor's cron-health check stays honest.
+        npx --yes "@hedgeling/i18n@$HEDGELING_VERSION" localize-plan "$WORKING_DIRECTORY" --heartbeat > "$plan_file"
+        action=$(node -e 'process.stdout.write(JSON.parse(require("node:fs").readFileSync(process.argv[1],"utf8")).action)' "$plan_file")
+        if [ "$action" = "error" ]; then
+          node -e '
+            const plan = JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8"));
+            console.log(`::error title=hedgeling sync-data::${plan.reason}: ${plan.offendingPaths.join(", ")}`);
+          ' "$plan_file"
+          exit 1
+        fi
+        if [ "$action" = "noop" ]; then
+          echo "committed=false" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        commit_paths="$RUNNER_TEMP/hedgeling-sync-data-commit-paths.txt"
+        node -e '
+          const fs = require("node:fs");
+          const plan = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+          fs.writeFileSync(process.argv[2], `${plan.commitPaths.join("\n")}\n`);
+        ' "$plan_file" "$commit_paths"
+
+        git config user.name "github-actions[bot]"
+        git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+        git add --pathspec-from-file="$commit_paths"
+        # --no-verify: canonical machine-generated bytes land verbatim — a
+        # hook reformatting them would break the zero-diff idempotency pin.
+        # [skip ci]: a bot-token push must never trigger another CI cycle.
+        git commit --no-verify -m "chore(i18n): hedgeling dynamic data sync [skip ci]"
+
+        # Push with the bot token when provided (HTTP(S) origins only):
+        # checkout's persisted extraheader is overridden for THIS push —
+        # nothing persisted, nothing in a URL, nothing echoed. Same auth
+        # discipline as the translate action's branch push.
+        push_auth=()
+        if [ -n "$BOT_TOKEN" ]; then
+          origin_url=$(git remote get-url origin)
+          case "$origin_url" in
+            http://*|https://*)
+              proto="${origin_url%%://*}"
+              host="${origin_url#*://}"; host="${host%%/*}"
+              auth_b64=$(printf '%s' "x-access-token:${BOT_TOKEN}" | base64 | tr -d '\n')
+              push_auth=(-c "http.${proto}://${host}/.extraheader=" -c "http.${proto}://${host}/.extraheader=AUTHORIZATION: basic ${auth_b64}")
+              ;;
+          esac
+        fi
+        # A concurrent push to the branch (merge queue, a human) must not fail
+        # the tick: rebase onto the moved head and retry, bounded attempts,
+        # never a force push. The commit touches only Hedgeling artifacts, so
+        # the rebase is clean unless another writer committed the SAME
+        # artifacts while this tick ran.
+        branch="${GITHUB_REF_NAME:?}"
+        conflicted=false
+        for attempt in 1 2 3; do
+          if git "${push_auth[@]}" push origin "HEAD:refs/heads/$branch"; then
+            echo "committed=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git fetch --no-tags origin "refs/heads/$branch"
+          # A conflicting rebase (another writer touched the same artifact)
+          # must not die mid-rebase under set -e: abort cleanly and fail with
+          # a message that names the cause.
+          git rebase FETCH_HEAD || { git rebase --abort || true; conflicted=true; break; }
+        done
+        if [ "$conflicted" = "true" ]; then
+          echo "::error title=hedgeling sync-data::another writer committed the same Hedgeling artifacts to $branch while this tick ran (an overlapping sync-data tick, or a manual commit to the data artifacts), so the rebase conflicted — nothing was pushed or published. The next tick starts from the fresh head and self-heals; if this repeats, make sure only ONE sync-data workflow writes $branch."
+          exit 1
+        fi
+        echo "::error title=hedgeling sync-data::could not push the artifact commit to $branch after $attempt attempt(s) — if $branch is protected, allow the bot token to push (or wire a token that can); the next cron tick will retry from a fresh checkout."
+        exit 1
+
+    # Console rows: the same `sync push` the sync action runs. Unchanged state
+    # short-circuits on stateHash (no HTTP) — the no-op path costs nothing.
+    # staleBase (another writer pushed to the console project since this
+    # repo's last sync) is surfaced and skips publish for the tick; the next tick self-heals from
+    # the fresh checkout.
+    - id: push
+      shell: bash
+      env:
+        HEDGELING_VERSION: ${{ inputs.hedgeling-version }}
+        WORKING_DIRECTORY: ${{ inputs.working-directory }}
+        HEDGELING_CONSOLE_TOKEN: ${{ inputs.console-token }}
+        CONSOLE_URL: ${{ inputs.console-url }}
+        PROJECT: ${{ inputs.project }}
+        MAX_ATTEMPTS: ${{ inputs.max-attempts }}
+        RETRY_DELAY: ${{ inputs.retry-delay }}
+        BOT_TOKEN: ${{ inputs.token }}
+        NPM_TOKEN: ${{ inputs.npm-token }}
+        # A seat token also tells the CLI which plan's limits apply.
+        HEDGELING_TOKEN: ${{ startsWith(inputs.npm-token, 'hdg_') && inputs.npm-token || env.HEDGELING_TOKEN }}
+        HEDGELING_NPMRC: ${{ steps.cli.outputs.userconfig }}
+      run: |
+        set -e
+        # npm auth from the preflight (step `cli`), when configured.
+        if [ -n "$HEDGELING_NPMRC" ]; then export NPM_CONFIG_USERCONFIG="$HEDGELING_NPMRC"; fi
+        json="$RUNNER_TEMP/hedgeling-sync-data-push.json"
+        rm -f "$json"
+        args=(sync push "$WORKING_DIRECTORY" --json)
+        [ -n "$CONSOLE_URL" ] && args+=(--origin "$CONSOLE_URL")
+        [ -n "$PROJECT" ] && args+=(--project "$PROJECT")
+        attempt=1
+        code=0
+        while :; do
+          code=0
+          npx --yes "@hedgeling/i18n@$HEDGELING_VERSION" "${args[@]}" > "$json" || code=$?
+          [ "$code" -ne 2 ] && break
+          [ "$attempt" -ge "$MAX_ATTEMPTS" ] && break
+          delay=$(( RETRY_DELAY * attempt ))
+          echo "::warning title=hedgeling sync-data push::attempt $attempt/$MAX_ATTEMPTS failed (exit 2, configuration/transport) — retrying in ${delay}s."
+          sleep "$delay"
+          attempt=$(( attempt + 1 ))
+        done
+        if [ "$code" -eq 2 ]; then
+          echo "::error title=hedgeling sync-data push::configuration/transport failure (exit 2) after $attempt attempt(s) — the artifact commit landed; the console push retries next tick."
+          exit 2
+        fi
+        # Push only exits 0 or 2 by contract — any other code (an npx
+        # meltdown, a signal) must fail the step, never fall through green.
+        if [ "$code" -ne 0 ]; then
+          echo "::error title=hedgeling sync-data push::sync push failed (exit $code) — the artifact commit landed; the console push retries next tick."
+          exit 1
+        fi
+        if ! node -e '
+          const fs = require("node:fs");
+          const body = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+          const staleBase = body.staleBase === true;
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, `stale-base=${staleBase}\npushed=${body.pushed === true}\n`);
+          if (staleBase) {
+            console.log("::warning title=hedgeling sync-data push::push applied, but another writer pushed to this project since the last sync from this repo (stale base) — publish is skipped this tick and the next tick self-heals. If this repeats every tick, check that no other repo or workflow pushes rows to this project (see \"Concurrency\" in actions/sync-data/README.md).");
+          }
+        ' "$json" 2>/dev/null; then
+          echo "::error title=hedgeling sync-data push::sync push exited 0 without a parseable report — the CLI itself failed to run."
+          exit 1
+        fi
+
+        # Bookkeeping (the sync action's cursor-commit discipline): a push
+        # that moved something rewrites .hedgeling/sync.json AFTER the
+        # artifact commit, and each cron tick starts from a FRESH checkout —
+        # without committing it here, the stateHash short-circuit never
+        # engages and every quiet tick re-pushes the full state. Efficiency,
+        # never correctness: a failed bookkeeping push only warns, and the
+        # next tick does a full (but still correct) push.
+        cursor="$WORKING_DIRECTORY/.hedgeling/sync.json"
+        if [ -n "$(git status --porcelain -- "$cursor")" ]; then
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -- "$cursor"
+          git commit --no-verify -m "chore(i18n): record hedgeling sync cursor [skip ci]"
+          push_auth=()
+          if [ -n "$BOT_TOKEN" ]; then
+            origin_url=$(git remote get-url origin)
+            case "$origin_url" in
+              http://*|https://*)
+                proto="${origin_url%%://*}"
+                host="${origin_url#*://}"; host="${host%%/*}"
+                auth_b64=$(printf '%s' "x-access-token:${BOT_TOKEN}" | base64 | tr -d '\n')
+                push_auth=(-c "http.${proto}://${host}/.extraheader=" -c "http.${proto}://${host}/.extraheader=AUTHORIZATION: basic ${auth_b64}")
+                ;;
+            esac
+          fi
+          branch="${GITHUB_REF_NAME:?}"
+          cursor_pushed=false
+          for cursor_attempt in 1 2 3; do
+            if git "${push_auth[@]}" push origin "HEAD:refs/heads/$branch"; then
+              cursor_pushed=true
+              break
+            fi
+            git fetch --no-tags origin "refs/heads/$branch"
+            git rebase FETCH_HEAD || { git rebase --abort || true; break; }
+          done
+          if [ "$cursor_pushed" != "true" ]; then
+            echo "::warning title=hedgeling sync-data push::could not push the sync-cursor bookkeeping commit to $branch — harmless (the next tick does a full, still-correct push), but if $branch is protected, wire a token that can push."
+          fi
+        fi
+
+    # Publish LAST — decouples serving from deploying: only after commit and
+    # sync push succeeded (a failed earlier step never reaches here), only
+    # when the bundle bytes changed, only when a command is configured, and
+    # never on a stale base. The spec-04 runtime reloads the published URL on
+    # `reloadIntervalMs`, so a console verification reaches production on the
+    # next cycle + reload interval, with NO deploy.
+    - id: publish
+      if: >-
+        inputs.publish-command != '' &&
+        steps.sync-data.outputs.bundle-changed == 'true' &&
+        steps.push.outputs.stale-base != 'true'
+      shell: bash
+      env:
+        PUBLISH_COMMAND: ${{ inputs.publish-command }}
+        HEDGELING_DYNAMIC_BUNDLE: ${{ steps.sync-data.outputs.bundle-path }}
+      run: |
+        set -e
+        bash -e -o pipefail -c "$PUBLISH_COMMAND"
+        echo "published=true" >> "$GITHUB_OUTPUT"
+
+    # Loop health LAST (dynamic-data spec 09): `sync-data --doctor` runs its
+    # read-only checks — network probes included — only AFTER the artifacts are
+    # committed and pushed, so health reporting can never lose completed work.
+    # Warnings (doctor exit 1) annotate the run and stay green; failures
+    # (exit 2) fail the JOB with the tick's work already safely landed. The
+    # adapter/API secrets the probes need arrive through the caller's job env,
+    # exactly as they do for the sync-data step itself.
+    - id: doctor
+      shell: bash
+      env:
+        HEDGELING_VERSION: ${{ inputs.hedgeling-version }}
+        WORKING_DIRECTORY: ${{ inputs.working-directory }}
+        HEDGELING_CONSOLE_TOKEN: ${{ inputs.console-token }}
+        NPM_TOKEN: ${{ inputs.npm-token }}
+        # A seat token also tells the CLI which plan's limits apply.
+        HEDGELING_TOKEN: ${{ startsWith(inputs.npm-token, 'hdg_') && inputs.npm-token || env.HEDGELING_TOKEN }}
+        HEDGELING_NPMRC: ${{ steps.cli.outputs.userconfig }}
+      run: |
+        # npm auth from the preflight (step `cli`), when configured.
+        if [ -n "$HEDGELING_NPMRC" ]; then export NPM_CONFIG_USERCONFIG="$HEDGELING_NPMRC"; fi
+        json="$RUNNER_TEMP/hedgeling-sync-data-doctor.json"
+        code=0
+        npx --yes "@hedgeling/i18n@$HEDGELING_VERSION" sync-data "$WORKING_DIRECTORY" --doctor --json > "$json" || code=$?
+        summarize() {
+          node -e '
+            const fs = require("node:fs");
+            let body; try { body = JSON.parse(fs.readFileSync(process.argv[1], "utf8")); } catch { process.exit(1); }
+            const bad = (body.checks ?? []).filter((c) => c.status === process.argv[2]);
+            if (bad.length === 0) process.exit(1);
+            console.log(bad.map((c) => `${c.source ? `[${c.source}] ` : ""}${c.name}: ${c.detail}`).join("; "));
+          ' "$json" "$1" 2>/dev/null
+        }
+        if [ "$code" -eq 0 ]; then
+          echo "doctor: loop healthy."
+        elif [ "$code" -eq 1 ]; then
+          echo "::warning title=hedgeling sync-data doctor::loop health warnings — $(summarize warn || echo 'see the doctor report')"
+        else
+          echo "::error title=hedgeling sync-data doctor::loop health failures — $(summarize fail || echo 'see the doctor report'). This tick's artifacts are already committed and pushed; the failure is the LOOP's health, not lost work."
+          exit 1
+        fi
+
+    - name: Job summary
+      if: always()
+      shell: bash
+      env:
+        PULL_CONFLICTS: ${{ steps.pull.outputs.conflicts }}
+        BUDGET_STOPPED: ${{ steps.sync-data.outputs.budget-stopped }}
+        BUNDLE_CHANGED: ${{ steps.sync-data.outputs.bundle-changed }}
+        COMMITTED: ${{ steps.commit.outputs.committed }}
+        STALE_BASE: ${{ steps.push.outputs.stale-base }}
+        PUBLISHED: ${{ steps.publish.outputs.published }}
+      run: |
+        # `if` guards, not bare `[ ... ] && …` — a false last test would fail
+        # the whole step (the translate action's summary-step regression).
+        if [ -n "$COMMITTED" ] || [ -n "$BUDGET_STOPPED" ]; then
+          {
+            echo "## Hedgeling sync data"
+            echo ""
+            if [ -n "$PULL_CONFLICTS" ] && [ "$PULL_CONFLICTS" != "0" ]; then
+              echo "- pull conflicts: **$PULL_CONFLICTS** (marked needs-review — resolve in the console review queue)"
+            fi
+            if [ "$BUDGET_STOPPED" = "true" ]; then
+              echo "- budget stopped: **yes** — completed work committed, the held cursor resumes next tick"
+            fi
+            echo "- committed: ${COMMITTED:-false}"
+            echo "- bundle bytes changed: ${BUNDLE_CHANGED:-false}"
+            if [ "$STALE_BASE" = "true" ]; then
+              echo "- stale base: **another writer pushed to this project since this repo's last sync** — publish skipped; the next tick self-heals (if it repeats, see \"Concurrency\" in actions/sync-data/README.md)"
+            fi
+            echo "- published: ${PUBLISHED:-skipped}"
+          } >> "$GITHUB_STEP_SUMMARY"
+        fi

@@ -1,0 +1,71 @@
+# v1.3.0 spec 06: automated localization PRs for projects using @hedgeling/i18n.
+#
+# Copy this file into your repo's .github/workflows/ directory (files inside
+# examples/ subfolders are never executed by GitHub Actions). When code merges
+# to the default branch, the localization work it created comes back as a
+# reviewable PR on the fixed branch `hedgeling/localize` — catalog, state, and
+# bundle diffs a human can approve — and that PR runs `hedgeling check` like
+# any other change (keep the check workflow from hedgeling-check.yml enabled,
+# and use `require-verified` to hold unreviewed locales at the gate).
+#
+# The action runs the SAME `hedgeling translate` pipeline a developer runs;
+# a run with no catalog/state/bundle diff produces no branch and no PR.
+name: Hedgeling localization
+
+on:
+  push:
+    branches: [main]   # your default branch
+  workflow_dispatch:   # manual "re-run the localization pipeline" button
+
+# Honest about writing: the branch and the PR are created with GITHUB_TOKEN.
+permissions:
+  contents: write
+  pull-requests: write
+
+# The branch is a singleton — serialize runs so two pushes can't race it.
+concurrency:
+  group: hedgeling-localize
+  cancel-in-progress: false
+
+jobs:
+  localize:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      # Zero config beyond the secret: extract + translate through the normal
+      # CLI entrypoints, decision via `localize-plan`, `gh pr create|edit`.
+      - name: Hedgeling translate
+        uses: Hedgeling/actions/translate@v1
+        with:
+          api-key: ${{ secrets.HEDGELING_TRANSLATE_API_KEY }}
+          # token: ${{ secrets.HEDGELING_BOT_TOKEN }}  # PAT/App token — the
+          #   default GITHUB_TOKEN creates PRs that do NOT trigger workflows,
+          #   so `hedgeling check` on the localization PR needs a real token.
+          # working-directory: packages/web   # monorepo: the project subfolder
+          # locales: fr-FR,de-DE              # override the config locales
+          # force-locales: fr-FR              # re-translate these even if current
+          # job: 'true'                       # spec 07: bind each run to a committed
+          #   translation-job artifact (.hedgeling/jobs/<id>.json) riding the same PR;
+          #   track progress later with `hedgeling job status <id>`.
+
+      # Raw-CLI variant (GitLab-style environments, or runners without
+      # marketplace access) — the same pipeline; you own branch/PR plumbing:
+      #
+      # - name: Setup Node.js
+      #   uses: actions/setup-node@v7
+      #   with:
+      #     node-version: '22'
+      # - name: Hedgeling translate
+      #   env:
+      #     HEDGELING_TRANSLATE_API_KEY: ${{ secrets.HEDGELING_TRANSLATE_API_KEY }}
+      #   run: |
+      #     npx --yes @hedgeling/i18n translate . \
+      #       --report "$RUNNER_TEMP/hedgeling-translate-report.json" \
+      #       --report-markdown "$RUNNER_TEMP/hedgeling-translate.md"
+      # - name: Decide
+      #   run: npx --yes @hedgeling/i18n localize-plan .
+      #   # then: branch hedgeling/localize, commit only the printed
+      #   # commitPaths, force-push, and create/edit the PR with the markdown
+      #   # report as its body.

@@ -1,0 +1,65 @@
+# dynamic-data spec 07: the closed git loop for dynamic content.
+#
+# Copy this file into your repo's .github/workflows/ directory (files inside
+# examples/ subfolders are never executed by GitHub Actions). Dynamic content
+# churns with the API, not with commits, so the loop is CRON-driven: each tick
+# runs `sync pull` (console truth in first) → `sync-data` (fetch Δ, translate,
+# recompile) → a direct, localize-plan-gated commit of the Hedgeling artifacts
+# (no PR per tick — review happens asynchronously in the console) →
+# `sync push` → a conditional publish of the dynamic bundle.
+#
+# A quiet tick is a true no-op (no commit, no push HTTP, no publish), so
+# aggressive schedules are cheap. A console verification reaches production on
+# the next tick + the runtime's reloadIntervalMs — with NO deploy.
+name: Hedgeling sync data
+
+on:
+  schedule:
+    - cron: '17 * * * *'   # hourly is a sane default for listing data
+  workflow_dispatch:        # manual "run a tick now" button
+
+# Honest about writing: the tick commits artifacts directly to the branch.
+permissions:
+  contents: write
+
+# Serialize THIS workflow's ticks in its own group. Never share one group
+# with the translate/sync workflows: GitHub keeps only one pending run per
+# group and cancels the older pending run when another queues — in a shared
+# group that silently drops a different writer's run. Overlapping writers are
+# safe (rebase-and-retry commits; the sync push's staleBase backstop).
+concurrency:
+  group: hedgeling-sync-data
+  cancel-in-progress: false
+
+jobs:
+  sync-data:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Hedgeling sync data
+        uses: Hedgeling/actions/sync-data@v1
+        env:
+          # Data-source API credentials ride workflow secrets → env — the
+          # spec-01 `env:` indirection ("auth": { "bearer": "env:MLS_TOKEN" }).
+          # They never land in any artifact or on argv.
+          MLS_TOKEN: ${{ secrets.MLS_TOKEN }}
+        with:
+          console-token: ${{ secrets.HEDGELING_CONSOLE_TOKEN }}
+          console-url: https://console.example.com
+          # Publish the compiled bundle to where the spec-04 runtime loads it
+          # (here: Supabase Storage for the reference app; any one-line upload
+          # works — the bundle path arrives in $HEDGELING_DYNAMIC_BUNDLE).
+          # REQUIRED when any source declares retention "external"; without
+          # it the bundle serves from the deployed repo copy and translations
+          # ride deploys (degraded but correct).
+          publish-command: >-
+            npx supabase storage cp "$HEDGELING_DYNAMIC_BUNDLE"
+            ss:///hedgeling/hedgeling-dynamic-bundle.json --experimental
+          # sources: lera-mls                # subset of configured dataSources
+          # budget-strings: '1000'           # per-source translation budget
+          # working-directory: packages/web  # monorepo: the project subfolder
+          # token: ${{ secrets.HEDGELING_BOT_TOKEN }}  # push via PAT/App token
+          #   (e.g. a protected branch's bypass list); the [skip ci] commit
+          #   message is what prevents a tick→tick loop either way.
