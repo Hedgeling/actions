@@ -21,7 +21,7 @@ inputs:
       spec: a version, a dist-tag, or a file: path to a local checkout). The
       default is pinned per action release.
     required: false
-    default: '1.15.0'
+    default: '1.16.0'
   npm-token:
     description: >-
       Token that lets this action install @hedgeling/i18n — wire from repo
